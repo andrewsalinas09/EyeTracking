@@ -1,7 +1,7 @@
 //! Precision Touchpad scrolling may bypass mouse wheel hooks entirely. Observe
 //! digitizer reports passively, using the HID descriptor parser from TrackpadGlass.
-//! Detect first finger contact and parallel two-finger travel passively. Contact
-//! state, not a movement timeout, owns rearming: resting fingers cannot jump twice.
+//! Contact arms the next raw pointer movement; touch alone must never warp a tap
+//! or double tap away from its target. Lift, not an idle timeout, rearms sliding.
 use std::{
     collections::HashMap,
     mem::{offset_of, size_of, zeroed},
@@ -16,18 +16,34 @@ struct Contact {
 #[derive(Default)]
 struct Landing {
     occupied: bool,
+    pending: bool,
 }
 impl Landing {
-    fn frame(&mut self, contacts: usize, blocked: bool) -> bool {
-        let land = !self.occupied && contacts == 1 && !blocked;
+    fn frame(&mut self, contacts: usize, blocked: bool) {
+        if contacts == 0 {
+            *self = Self::default();
+            return;
+        }
+        if !self.occupied {
+            self.pending = contacts == 1 && !blocked;
+        }
+        if blocked || contacts != 1 {
+            self.pending = false;
+        }
         self.occupied = contacts != 0;
-        land
+    }
+    fn motion(&mut self, moved: bool, blocked: bool) -> bool {
+        let jump = moved && !blocked && self.pending;
+        if moved || blocked {
+            self.pending = false;
+        }
+        jump
     }
 }
 #[derive(Default, serde::Serialize)]
 pub struct Frame {
     pub contacts: Option<usize>,
-    pub land: bool,
+    pub armed: bool,
     pub multi: bool,
     pub scroll_start: bool,
     pub scrolling: bool,
@@ -200,6 +216,7 @@ impl Device {
         // A malformed/palm report is not evidence of lift-off. Require an
         // explicit empty contact frame before permitting another landing.
         self.landing.occupied = true;
+        self.landing.pending = false;
         self.gesture.used = true;
         self.gesture.scrolling = false;
         Frame {
@@ -240,10 +257,10 @@ impl Device {
         }
         let multi = contacts.len() >= 2;
         let trigger = self.gesture.frame(&contacts, blocked || button);
-        let land = self.landing.frame(contacts.len(), blocked || button);
+        self.landing.frame(contacts.len(), blocked || button);
         Some(Frame {
             contacts: Some(contacts.len()),
-            land,
+            armed: self.landing.pending,
             multi,
             scroll_start: trigger,
             scrolling: self.gesture.scrolling,
@@ -255,14 +272,31 @@ pub struct Touchpad {
     devices: HashMap<usize, Option<Device>>,
     pub reports: u64,
     pub gestures: u64,
-    pub landings: u64,
+    pub slides: u64,
 }
 impl Touchpad {
     pub fn contact_mode(&self) -> bool {
         self.devices.values().flatten().any(|d| d.seen)
     }
-    pub fn occupied(&self) -> bool {
-        self.devices.values().flatten().any(|d| d.landing.occupied)
+    pub fn armed(&self) -> bool {
+        let mut occupied = self
+            .devices
+            .values()
+            .flatten()
+            .filter(|d| d.landing.occupied);
+        match occupied.next() {
+            None => true,
+            Some(d) => d.landing.pending && occupied.next().is_none(),
+        }
+    }
+    pub fn motion(&mut self, moved: bool, blocked: bool) -> bool {
+        let blocked = blocked || !self.armed();
+        let mut jump = false;
+        for device in self.devices.values_mut().flatten() {
+            jump |= device.landing.motion(moved, blocked);
+        }
+        self.slides += u64::from(jump);
+        jump
     }
     pub unsafe fn register(hwnd: HWND) -> bool {
         let device = RAWINPUTDEVICE {
@@ -329,7 +363,6 @@ impl Touchpad {
                 .unwrap_or_else(|| dev.uncertain());
             self.reports += 1;
             self.gestures += u64::from(frame.scroll_start);
-            self.landings += u64::from(frame.land);
             frames.push(frame);
         }
         Some(frames)
@@ -339,33 +372,47 @@ impl Touchpad {
 mod tests {
     use super::*;
     #[test]
-    fn contact_jumps_once_until_all_fingers_lift_without_a_time_threshold() {
+    fn tap_and_double_tap_do_not_jump_but_first_slide_does() {
         let mut l = Landing::default();
-        assert!(l.frame(1, false));
-        for _ in 0..10000 {
-            assert!(!l.frame(1, false));
+        for _ in 0..2 {
+            l.frame(1, false);
+            assert!(!l.motion(false, false));
+            l.frame(0, false);
+            assert!(!l.motion(false, true)); // Windows' synthesized tap click.
         }
-        assert!(!l.frame(0, false));
-        assert!(l.frame(1, false));
-        assert!(!l.frame(2, false));
-        assert!(!l.frame(1, false));
-        assert!(!l.frame(0, false));
-        assert!(l.frame(1, false));
+        l.frame(1, false);
+        assert!(l.motion(true, false));
+        for _ in 0..10000 {
+            l.frame(1, false);
+            assert!(!l.motion(true, false));
+        }
+        l.frame(0, false);
+        assert!(!l.motion(true, false)); // Late emulated packet after lift.
+        l.frame(1, false);
+        assert!(l.motion(true, false));
     }
     #[test]
     fn blocked_or_multi_contact_requires_full_lift_even_after_unblocking() {
         for contacts in [1, 2, 3] {
             let mut l = Landing::default();
-            assert!(!l.frame(contacts, true));
-            assert!(!l.frame(1, false));
+            l.frame(contacts, true);
+            l.frame(1, false);
+            assert!(!l.motion(true, false));
             l.frame(0, false);
-            assert!(l.frame(1, false));
+            l.frame(1, false);
+            assert!(l.motion(true, false));
         }
         let mut l = Landing::default();
-        assert!(!l.frame(2, false));
-        assert!(!l.frame(1, false));
+        l.frame(2, false);
+        l.frame(1, false);
+        assert!(!l.motion(true, false));
         l.frame(0, false);
-        assert!(l.frame(1, false));
+        l.frame(1, false);
+        assert!(!l.motion(true, true)); // Click/drag consumes the pending slide.
+        assert!(!l.motion(true, false));
+        l.frame(0, false);
+        l.frame(1, false);
+        assert!(l.motion(true, false));
     }
     fn pair(y: f64) -> [Contact; 2] {
         [

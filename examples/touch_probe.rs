@@ -42,7 +42,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     let mut raw:RAWINPUT=zeroed();let mut size=size_of::<RAWINPUT>() as u32;
                     if GetRawInputData(l as HRAWINPUT,RID_INPUT,&mut raw as *mut _ as *mut _,&mut size,size_of::<RAWINPUTHEADER>() as u32)==u32::MAX{return;}
                     let m=raw.data.mouse;
-                    json!({"us":time,"kind":"mouse","dx":m.lLastX,"dy":m.lLastY,"buttons":m.Anonymous.Anonymous.usButtonFlags})
+                    let slide=p.pad.motion(m.lLastX!=0 || m.lLastY!=0,m.Anonymous.Anonymous.usButtonFlags!=0);
+                    json!({"us":time,"kind":"mouse","dx":m.lLastX,"dy":m.lLastY,"buttons":m.Anonymous.Anonymous.usButtonFlags,"slide":slide})
                 } else {return;};
                 let _=writeln!(p.file,"{event}");
             }});

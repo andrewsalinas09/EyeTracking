@@ -1,10 +1,8 @@
-//! Touchpad contact owns landing/rearming when a supported pad is detected;
-//! raw motion is then refinement only, including after long stationary contact.
+//! A supported touchpad arms on contact and jumps on the first raw movement.
+//! Taps never jump; further motion refines until all fingers lift to rearm.
 //! Without contact reports, raw physical motion retains its burst fallback. This window
 //! runs on its own thread so full-screen preview painting cannot stall input.
 //! Precision touchpads can have a null hDevice; that is deliberately accepted.
-//! Touch landings also issue a tagged zero-distance mouse update: SetCursorPos
-//! alone need not refresh the visible pointer until the next physical movement.
 use crate::{
     calibration::{Display, Model, Report},
     tobii::State,
@@ -29,18 +27,8 @@ use windows_sys::Win32::{
 
 const IDLE_MS: u32 = 300;
 const TOGGLE: u32 = WM_APP + 1;
-const LANDING_TAG: usize = 0x4559454c;
-fn cursor_refresh_input() -> INPUT {
-    INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dwFlags: MOUSEEVENTF_MOVE,
-                dwExtraInfo: LANDING_TAG,
-                ..unsafe { zeroed() }
-            },
-        },
-    }
+fn recent_click(last: Option<u32>, now: u32, interval: u32) -> bool {
+    last.is_some_and(|t| now.wrapping_sub(t) < interval)
 }
 #[derive(Default)]
 struct Burst {
@@ -141,6 +129,7 @@ impl Controller {
                 config: cfg,
                 enabled,
                 burst: Burst::default(),
+                last_click: None,
                 absolute: HashMap::new(),
                 jumps: 0,
                 misses: 0,
@@ -283,6 +272,7 @@ struct Context {
     config: Arc<Mutex<Config>>,
     enabled: bool,
     burst: Burst,
+    last_click: Option<u32>,
     absolute: HashMap<usize, (i32, i32)>,
     jumps: u64,
     misses: u64,
@@ -304,7 +294,7 @@ unsafe fn surface_at(point: POINT) -> usize {
 impl Context {
     fn armed(&self, now: u32) -> bool {
         if self.touchpad.contact_mode() {
-            !self.touchpad.occupied()
+            self.touchpad.armed()
         } else {
             self.burst.armed(now)
         }
@@ -337,10 +327,13 @@ impl Context {
                 },
             )
         };
-        if let Some(frames) = self
-            .touchpad
-            .input(l, !allowed || modifiers || buttons_down())
-        {
+        if let Some(frames) = self.touchpad.input(
+            l,
+            !allowed
+                || modifiers
+                || buttons_down()
+                || recent_click(self.last_click, GetTickCount(), GetDoubleClickTime()),
+        ) {
             crate::scroll::update(allowed, point, GetTickCount());
             for frame in frames {
                 if frame.multi {
@@ -350,9 +343,6 @@ impl Context {
                         .unwrap()
                         .learning
                         .cancel("Skipped: two-finger gesture");
-                }
-                if frame.land {
-                    self.jump(GetTickCount(), modifiers, "touch");
                 }
                 crate::scroll::touchpad(frame.multi, frame.scroll_start, frame.scrolling);
             }
@@ -374,9 +364,6 @@ impl Context {
             return;
         }
         let mouse = input.data.mouse;
-        if mouse.ulExtraInformation == LANDING_TAG as u32 {
-            return; // Our display refresh is not physical correction or a new burst.
-        }
         let moved = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
             let next = (mouse.lLastX, mouse.lLastY);
             self.absolute.insert(input.header.hDevice as usize, next) != Some(next)
@@ -388,6 +375,9 @@ impl Context {
         }
         let now = GetMessageTime() as u32;
         let flags = mouse.Anonymous.Anonymous.usButtonFlags;
+        if flags & 0x03ff != 0 {
+            self.last_click = Some(now);
+        }
         let mut cfg = self.config.lock().unwrap();
         let mut cursor: POINT = zeroed();
         let has_cursor = GetCursorPos(&mut cursor) != 0;
@@ -412,18 +402,29 @@ impl Context {
             );
         }
         let blocked = buttons_down()
+            || recent_click(self.last_click, now, GetDoubleClickTime())
             || flags != 0
             || !self.enabled
             || cfg.calibrating
             || modifiers
             || !self.display_ok
-            || GetTickCount().wrapping_sub(now) > 100
-            || self.touchpad.contact_mode();
-        if !self.burst.input(now, moved, blocked) {
+            || GetTickCount().wrapping_sub(now) > 100;
+        let contact_mode = self.touchpad.contact_mode();
+        let jump = if contact_mode {
+            self.burst.input(now, moved, true);
+            self.touchpad.motion(moved, blocked)
+        } else {
+            self.burst.input(now, moved, blocked)
+        };
+        if !jump {
             return;
         }
         drop(cfg);
-        self.jump(now, modifiers, "motion");
+        self.jump(
+            now,
+            modifiers,
+            if contact_mode { "slide" } else { "motion" },
+        );
     }
     unsafe fn jump(&mut self, now: u32, modifiers: bool, source: &str) {
         let mut cfg = self.config.lock().unwrap();
@@ -457,14 +458,9 @@ impl Context {
         }
         let [x, y] = cfg.screen_point(point.unwrap());
         if SetCursorPos(x, y) != 0 {
-            let refreshed = source != "touch"
-                || SendInput(1, &cursor_refresh_input(), size_of::<INPUT>() as i32) == 1;
             self.jumps += 1;
             cfg.learning.record_jump(source, true);
             self.last_error.clear();
-            if !refreshed {
-                self.last_error = "Landed, but Windows rejected the pointer refresh".into();
-            }
             // Save pre-adaptation gaze at the jump. Later eye motion is not a label.
             let base = cfg.base_point(point.unwrap());
             let rect = cfg.display.rect;
@@ -518,11 +514,13 @@ impl Context {
             "DISPLAY CHANGED"
         } else if self.gaze().is_none() {
             "NO GAZE"
-        } else if buttons_down() {
+        } else if buttons_down()
+            || recent_click(self.last_click, GetTickCount(), GetDoubleClickTime())
+        {
             "DRAG / CLICK"
         } else if self.armed(GetTickCount()) {
             if self.touchpad.contact_mode() {
-                "ARMED - touch to land"
+                "ARMED - slide to land"
             } else {
                 "ARMED - move to jump"
             }
@@ -533,14 +531,14 @@ impl Context {
         let (trained, total) = learning.coverage();
         let dot_state = if self.dot_visible { "ON" } else { "OFF" };
         let mode = if self.touchpad.contact_mode() {
-            "Touch to land; lift to rearm"
+            "Slide to land; lift to rearm"
         } else {
             "Motion: 300 ms rearm"
         };
-        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n{mode}  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} landings, {} scrolls\n{}",
+        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n{mode}  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} slides, {} scrolls\n{}",
             self.jumps, self.misses, if cfg.model.is_some() { "calibrated" } else { "raw gaze" },
             self.motions, self.last_error, if learning.enabled { "ON" } else { "FROZEN" },
-            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.landings, self.touchpad.gestures, learning.recording_status()));
+            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.slides, self.touchpad.gestures, learning.recording_status()));
         r.left += 12;
         r.top += 8;
         DrawTextW(dc, text.as_ptr(), -1, &mut r, DT_LEFT | DT_NOPREFIX);
@@ -579,6 +577,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         crate::scroll::SCROLLED => {
+            ctx.touchpad.motion(false, true);
             ctx.config
                 .lock()
                 .unwrap()
@@ -621,6 +620,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_HOTKEY | TOGGLE => {
             ctx.enabled = !ctx.enabled;
+            ctx.touchpad.motion(false, true);
             ctx.config
                 .lock()
                 .unwrap()
@@ -644,8 +644,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT]
                 .iter()
                 .any(|k| GetAsyncKeyState(*k as i32) < 0);
-            let ready =
-                point.is_some() && ctx.enabled && !buttons_down() && !modifiers && ctx.armed(now);
+            let ready = point.is_some()
+                && ctx.enabled
+                && !buttons_down()
+                && !modifiers
+                && ctx.armed(now)
+                && !recent_click(ctx.last_click, now, GetDoubleClickTime());
             ctx.dot.update(point.filter(|_| ctx.dot_visible), ready);
             0
         }
@@ -698,13 +702,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
 mod tests {
     use super::*;
     #[test]
-    fn touch_refresh_is_tagged_zero_motion_without_buttons_or_wheel() {
-        let input = cursor_refresh_input();
-        assert_eq!(input.r#type, INPUT_MOUSE);
-        let mouse = unsafe { input.Anonymous.mi };
-        assert_eq!((mouse.dx, mouse.dy, mouse.mouseData), (0, 0, 0));
-        assert_eq!(mouse.dwFlags, MOUSEEVENTF_MOVE);
-        assert_eq!(mouse.dwExtraInfo, LANDING_TAG);
+    fn double_click_protection_uses_system_interval_and_handles_clock_wrap() {
+        assert!(!recent_click(None, 0, 500));
+        assert!(recent_click(Some(100), 599, 500));
+        assert!(!recent_click(Some(100), 600, 500));
+        assert!(recent_click(Some(u32::MAX - 100), 20, 500));
     }
     #[test]
     fn every_burst_jumps_once_including_tiny_moves_and_long_fine_control() {
