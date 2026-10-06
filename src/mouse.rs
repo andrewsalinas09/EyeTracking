@@ -113,6 +113,7 @@ impl Controller {
             };
             let mut ctx = Box::new(Context {
                 dot,
+                dot_visible: true,
                 state,
                 config: cfg,
                 enabled,
@@ -157,10 +158,11 @@ impl Controller {
             if RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8 as u32) == 0
                 || RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F9 as u32) == 0
                 || RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10 as u32) == 0
+                || RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7 as u32) == 0
                 || RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0
             {
                 let _ = tx.send(Err(
-                    "Mouse setup failed: raw input or Ctrl+Alt+F8/F9/F10 unavailable".into(),
+                    "Mouse setup failed: raw input or Ctrl+Alt+F7/F8/F9/F10 unavailable".into(),
                 ));
                 DestroyWindow(hwnd);
                 return;
@@ -245,6 +247,7 @@ impl Drop for Controller {
 struct Context {
     touchpad: crate::touchpad::Touchpad,
     dot: crate::gaze_dot::GazeDot,
+    dot_visible: bool,
     state: Arc<Mutex<State>>,
     config: Arc<Mutex<Config>>,
     enabled: bool,
@@ -440,7 +443,8 @@ impl Context {
         };
         let learning = &cfg.learning;
         let (trained, total) = learning.coverage();
-        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements   {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls",
+        let dot_state = if self.dot_visible { "ON" } else { "OFF" };
+        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls",
             self.jumps, self.misses, if cfg.model.is_some() { "calibrated" } else { "raw gaze" },
             self.motions, self.last_error, if learning.enabled { "ON" } else { "FROZEN" },
             learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.gestures));
@@ -494,6 +498,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             ctx.input(l);
             DefWindowProcW(hwnd, msg, w, l)
         }
+        WM_HOTKEY if w == 4 => {
+            ctx.dot_visible = !ctx.dot_visible;
+            if !ctx.dot_visible {
+                ctx.dot.update(None, false);
+            }
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
         WM_HOTKEY if w == 2 || w == 3 => {
             let mut cfg = ctx.config.lock().unwrap();
             if w == 2 {
@@ -527,7 +539,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let now = GetTickCount();
             crate::scroll::update(ctx.enabled, point, now);
             let ready = point.is_some() && ctx.enabled && !buttons_down() && ctx.burst.armed(now);
-            ctx.dot.update(point, ready);
+            ctx.dot.update(point.filter(|_| ctx.dot_visible), ready);
             0
         }
         WM_TIMER => {
@@ -559,6 +571,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             UnregisterHotKey(hwnd, 1);
             UnregisterHotKey(hwnd, 2);
             UnregisterHotKey(hwnd, 3);
+            UnregisterHotKey(hwnd, 4);
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

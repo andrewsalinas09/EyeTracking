@@ -28,6 +28,7 @@ handles device access and retries connection failures.
 | C | Start a full-screen calibration experiment |
 | R | Toggle results map / live preview after calibration |
 | A | Toggle this app's correction on/off after calibration |
+| Ctrl+Alt+F7 | Show/hide the desktop gaze dot globally |
 | W / Ctrl+Alt+F8 | Toggle gaze mouse (Ctrl+Alt+F8 works globally) |
 | Ctrl+Alt+F9 | Freeze/resume continuous learning; keep the current correction map |
 | Ctrl+Alt+F10 | Reset the learned correction map and click history |
@@ -108,6 +109,9 @@ during calibration, so it never shows an old position as live gaze.
 Black means the next movement is armed to jump. Orange means movement will stay
 in fine control, including the 300 ms rearm interval, held buttons, and paused
 mouse assistance. Color refreshes every 16 ms, even if the gaze position is still.
+**Ctrl+Alt+F7** shows/hides just the desktop dot from any app; mouse jumps,
+gaze scrolling, and learning continue unchanged. The HUD shows Dot ON/OFF.
+The dot starts visible each time the app launches.
 Raw Input accepts precision touchpads with null device handles, and cursor warps
 do not feed back as physical motion. The latest gaze sample must be valid and no
 older than 200 ms. A missing sample consumes that movement attempt with a visible
