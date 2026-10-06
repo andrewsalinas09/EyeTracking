@@ -895,8 +895,7 @@ pub fn run() {
                 report,
                 show_report: false,
                 correction,
-                notice: "W or Ctrl+Alt+F8: gaze mouse. First movement after 300 ms idle jumps."
-                    .into(),
+                notice: "Ctrl+Alt+F6: status panel. W or Ctrl+Alt+F8: gaze mouse.".into(),
             })
         });
         let hwnd = CreateWindowExW(

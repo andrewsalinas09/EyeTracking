@@ -29,6 +29,7 @@ handles device access and retries connection failures.
 | R | Toggle results map / live preview after calibration |
 | A | Toggle this app's correction on/off after calibration |
 | Ctrl+Alt+F7 | Show/hide the desktop gaze dot globally |
+| Ctrl+Alt+F6 | Show/hide the status panel globally (hidden on startup) |
 | W / Ctrl+Alt+F8 | Toggle gaze mouse (Ctrl+Alt+F8 works globally) |
 | Ctrl+Alt+F9 | Freeze/resume continuous learning; keep the current correction map |
 | Ctrl+Alt+F10 | Reset the learned correction map and click history |
@@ -100,6 +101,8 @@ or fixation threshold. Continued movement provides normal fine control. The next
 300 ms pause rearms it. Button presses, dragging and scrolling reset that pause.
 
 A click-through status panel shows ARMED, FINE CONTROL, PAUSED or NO GAZE, plus
+learning and recording status. It starts hidden; **Ctrl+Alt+F6** shows or hides it
+without changing gaze control, the dot, or learning. The panel also includes
 successful and missed jump counts. **Ctrl+Alt+F8** pauses/resumes from any app;
 closing the preview stops the controller. It runs on a separate input thread.
 A tiny gaze dot with a one-pixel white rim stays above desktop apps,

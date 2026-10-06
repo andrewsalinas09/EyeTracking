@@ -165,10 +165,11 @@ impl Controller {
                 || RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F9 as u32) == 0
                 || RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10 as u32) == 0
                 || RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7 as u32) == 0
+                || RegisterHotKey(hwnd, 5, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F6 as u32) == 0
                 || RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0
             {
                 let _ = tx.send(Err(
-                    "Mouse setup failed: raw input or Ctrl+Alt+F7/F8/F9/F10 unavailable".into(),
+                    "Mouse setup failed: raw input or Ctrl+Alt+F6/F7/F8/F9/F10 unavailable".into(),
                 ));
                 DestroyWindow(hwnd);
                 return;
@@ -186,7 +187,7 @@ impl Controller {
             };
             SetTimer(hwnd, 1, 50, None);
             SetTimer(hwnd, 2, 16, None);
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Keep the input receiver alive while the status panel starts hidden.
             let _ = tx.send(Ok(hwnd as usize));
             let mut msg: MSG = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -511,6 +512,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             ctx.input(l);
             DefWindowProcW(hwnd, msg, w, l)
         }
+        WM_HOTKEY if w == 5 => {
+            let show = IsWindowVisible(hwnd) == 0;
+            ShowWindow(hwnd, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            if show {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_HOTKEY if w == 4 => {
             ctx.dot_visible = !ctx.dot_visible;
             if !ctx.dot_visible {
@@ -592,6 +601,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             UnregisterHotKey(hwnd, 2);
             UnregisterHotKey(hwnd, 3);
             UnregisterHotKey(hwnd, 4);
+            UnregisterHotKey(hwnd, 5);
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
