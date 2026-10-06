@@ -59,12 +59,13 @@ impl Config {
     // Shared by the desktop dot and the jump: both show/use the exact same map.
     fn screen_point(&self, point: [f64; 2]) -> [i32; 2] {
         let point = self.base_point(point);
+        let offset = self.learning.offset_at(point, self.display.rect);
         let [left, top, right, bottom] = self.display.rect;
         [
-            (point[0] + self.learning.offset[0])
+            (point[0] + offset[0])
                 .round()
                 .clamp(left as f64, (right - 1) as f64) as i32,
-            (point[1] + self.learning.offset[1])
+            (point[1] + offset[1])
                 .round()
                 .clamp(top as f64, (bottom - 1) as f64) as i32,
         ]
@@ -207,13 +208,16 @@ impl Controller {
         cfg.model = enabled.then(|| report.model.clone());
         cfg.learning.reset();
     }
-    pub fn offset(&self, display: &Display) -> [f32; 2] {
+    pub fn offset(&self, display: &Display, base: [f32; 2]) -> [f32; 2] {
         let cfg = self.config.lock().unwrap();
         if cfg.display != *display || cfg.calibrating {
             return [0.0; 2];
         }
         let size = display.size();
-        std::array::from_fn(|axis| (cfg.learning.offset[axis] / size[axis]) as f32)
+        let point =
+            std::array::from_fn(|axis| display.rect[axis] as f64 + base[axis] as f64 * size[axis]);
+        let offset = cfg.learning.offset_at(point, display.rect);
+        std::array::from_fn(|axis| (offset[axis] / size[axis]) as f32)
     }
     pub fn calibration(&self, active: bool, report: Option<&Report>) {
         let mut cfg = self.config.lock().unwrap();
@@ -435,10 +439,11 @@ impl Context {
             "FINE CONTROL"
         };
         let learning = &cfg.learning;
-        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements   {}\nLearn {}: {} clicks, {} updates | offset {:+.1}, {:+.1} px\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls",
+        let (trained, total) = learning.coverage();
+        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements   {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls",
             self.jumps, self.misses, if cfg.model.is_some() { "calibrated" } else { "raw gaze" },
             self.motions, self.last_error, if learning.enabled { "ON" } else { "FROZEN" },
-            learning.accepted, learning.updates, learning.offset[0], learning.offset[1], learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.gestures));
+            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.gestures));
         r.left += 12;
         r.top += 8;
         DrawTextW(dc, text.as_ptr(), -1, &mut r, DT_LEFT | DT_NOPREFIX);
@@ -519,8 +524,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     ctx.gaze().map(|p| cfg.screen_point(p))
                 }
             };
-            crate::scroll::update(ctx.enabled, point, GetTickCount());
-            ctx.dot.update(point);
+            let now = GetTickCount();
+            crate::scroll::update(ctx.enabled, point, now);
+            let ready = point.is_some() && ctx.enabled && !buttons_down() && ctx.burst.armed(now);
+            ctx.dot.update(point, ready);
             0
         }
         WM_TIMER => {

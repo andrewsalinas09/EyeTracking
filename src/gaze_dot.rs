@@ -1,5 +1,6 @@
 //! Tiny desktop overlay. A layered, nonactivating window keeps all mouse input
-//! going to the app underneath; the white rim makes black visible on dark pages.
+//! going to the app underneath. Black means the next motion can jump; orange
+//! means fine control or paused. The white rim keeps it visible on dark pages.
 use std::{
     mem::zeroed,
     ptr::{null, null_mut},
@@ -14,6 +15,7 @@ const TRANSPARENT_COLOR: u32 = 0x00ff00ff;
 pub struct GazeDot {
     hwnd: HWND,
     position: Option<[i32; 2]>,
+    ready: bool,
 }
 impl GazeDot {
     pub unsafe fn new() -> Result<Self, String> {
@@ -51,9 +53,17 @@ impl GazeDot {
         Ok(Self {
             hwnd,
             position: None,
+            ready: false,
         })
     }
-    pub unsafe fn update(&mut self, position: Option<[i32; 2]>) {
+    pub unsafe fn update(&mut self, position: Option<[i32; 2]>, ready: bool) {
+        if ready != self.ready {
+            self.ready = ready;
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, ready as isize);
+            // Repaint even when the gaze has not moved: the idle timer alone
+            // can rearm a jump while the dot stays at exactly the same pixel.
+            InvalidateRect(self.hwnd, null(), 0);
+        }
         if position == self.position {
             return;
         }
@@ -100,9 +110,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
             let old_brush = SelectObject(dc, GetStockObject(WHITE_BRUSH));
             Ellipse(dc, 0, 0, SIZE, SIZE);
-            SelectObject(dc, GetStockObject(BLACK_BRUSH));
+            let color = if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0 {
+                0x00000000
+            } else {
+                0x00008cff // RGB(255, 140, 0), COLORREF uses BGR byte order.
+            };
+            let fill = CreateSolidBrush(color);
+            SelectObject(dc, fill);
             Ellipse(dc, 1, 1, SIZE - 1, SIZE - 1);
             SelectObject(dc, old_brush);
+            DeleteObject(fill);
             SelectObject(dc, old_pen);
             EndPaint(hwnd, &ps);
             0

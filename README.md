@@ -29,8 +29,8 @@ handles device access and retries connection failures.
 | R | Toggle results map / live preview after calibration |
 | A | Toggle this app's correction on/off after calibration |
 | W / Ctrl+Alt+F8 | Toggle gaze mouse (Ctrl+Alt+F8 works globally) |
-| Ctrl+Alt+F9 | Freeze/resume continuous learning; keep the current offset |
-| Ctrl+Alt+F10 | Reset the learned offset and click history |
+| Ctrl+Alt+F9 | Freeze/resume continuous learning; keep the current correction map |
+| Ctrl+Alt+F10 | Reset the learned correction map and click history |
 | F11 | Toggle full screen |
 | M | Move preview to the next display |
 | T | Toggle gaze trail |
@@ -100,11 +100,14 @@ or fixation threshold. Continued movement provides normal fine control. The next
 A click-through status panel shows ARMED, FINE CONTROL, PAUSED or NO GAZE, plus
 successful and missed jump counts. **Ctrl+Alt+F8** pauses/resumes from any app;
 closing the preview stops the controller. It runs on a separate input thread.
-A tiny black gaze dot with a one-pixel white rim stays above desktop apps,
+A tiny gaze dot with a one-pixel white rim stays above desktop apps,
 including while the preview is minimized or mouse jumps are paused. Its center
 uses the same calibrated position as a jump. The dot is nine physical pixels
 wide, takes no focus and passes clicks through. It hides on tracking loss or
 during calibration, so it never shows an old position as live gaze.
+Black means the next movement is armed to jump. Orange means movement will stay
+in fine control, including the 300 ms rearm interval, held buttons, and paused
+mouse assistance. Color refreshes every 16 ms, even if the gaze position is still.
 Raw Input accepts precision touchpads with null device handles, and cursor warps
 do not feed back as physical motion. The latest gaze sample must be valid and no
 older than 200 ms. A missing sample consumes that movement attempt with a visible
@@ -130,14 +133,24 @@ Scrolling, other buttons, keyboard modifiers, crossing top-level windows, edge
 clamping, dragging over 4 pixels, and delayed input invalidate the attempt. These
 are learning filters only; the first-motion jump still has no travel threshold.
 
-The learner keeps the last 9 candidate offsets for up to 5 minutes, weights them
-with a 1-minute half-life, and requires at least 5 within 20 pixels of their robust
-median and 60% of the recent weight. A disagreeing new click cannot update the
-offset. Each update moves 15% toward the consensus, limited to 2 pixels per click
-and 80 pixels total. The dot, live preview, jumps and gaze scrolling use this offset.
+The learner maintains a 7-column by 5-row field of local XY corrections over the
+base gaze position. Both horizontal and vertical errors can vary with both screen
+coordinates. Bilinear interpolation makes the correction continuous between grid
+points; areas without nearby evidence retain the base calibration.
 
-The HUD shows accepted clicks, applied updates, offset, and the most recent learning
-status. Ctrl+Alt+F9 freezes learning without removing the offset; Ctrl+Alt+F10 resets
+Up to 256 candidate labels are kept for 5 minutes. Each grid point considers its
+last 9 nearby labels, within a radius of 0.30 in normalized screen coordinates.
+Weights taper smoothly to zero at that radius and decay with a 1-minute half-life.
+At least 5 labels must agree within 20 pixels of their weighted median and make up
+60% of the local weight. A disagreeing new click cannot update that grid point.
+Updates move 15% toward local consensus, scaled by the new click's proximity,
+limited to 2 pixels per click and 80 pixels total. Neighboring corrections also
+have a spatial gradient limit to prevent folding the map. The dot, live preview,
+jumps and gaze scrolling all use the same position-dependent correction.
+
+The HUD shows accepted clicks, applied updates, trained grid points out of 35,
+and the most recent learning status. Ctrl+Alt+F9 freezes learning without removing
+the correction map; Ctrl+Alt+F10 resets
 it. Starting calibration or toggling its base correction resets adaptation too.
 This first implementation learns for the current run: restart starts fresh rather
 than applying a previous sitting position. It does not rewrite the saved model or

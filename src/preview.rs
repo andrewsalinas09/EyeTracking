@@ -359,12 +359,12 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
     let correction_active = app.correction
         && app.report.as_ref().is_some_and(|r| r.display == current)
         && app.session.is_none();
-    let learned = app
-        .mouse
-        .as_ref()
-        .map_or([0.0; 2], |mouse| mouse.offset(&current));
     let live_position = |point| {
         let base = corrected(app.report.as_ref(), correction_active, point, &current);
+        let learned = app
+            .mouse
+            .as_ref()
+            .map_or([0.0; 2], |mouse| mouse.offset(&current, base));
         [base[0] + learned[0], base[1] + learned[1]]
     };
     let mut origin = POINT { x: 0, y: 0 };

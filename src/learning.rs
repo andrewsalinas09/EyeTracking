@@ -1,6 +1,8 @@
 //! Session-local implicit calibration. Clicks are noisy labels, not ground truth.
 //! Store click minus the BASE gaze map, not minus the already corrected landing;
 //! otherwise applying each residual repeatedly would create a feedback drift.
+//! Spatial errors cannot be represented by one global offset: learn a local
+//! residual field and interpolate it continuously at the base gaze position.
 use std::collections::VecDeque;
 
 type XY = [f64; 2];
@@ -10,6 +12,16 @@ const MAX_CORRECTION: f64 = 120.0;
 const MAX_OFFSET: f64 = 80.0;
 const CONSENSUS_RADIUS: f64 = 20.0;
 const MAX_STEP: f64 = 2.0;
+const COLS: usize = 7;
+const ROWS: usize = 5;
+const LOCAL_RADIUS: f64 = 0.30;
+const MAX_LABELS: usize = 256;
+
+#[derive(Clone, Copy, Default)]
+struct Node {
+    offset: XY,
+    trained: bool,
+}
 
 struct Attempt {
     time: u32,
@@ -24,11 +36,12 @@ struct Attempt {
 }
 struct Label {
     time: u32,
+    position: XY,
     offset: XY,
 }
 pub struct Learner {
     pub enabled: bool,
-    pub offset: XY,
+    field: [Node; COLS * ROWS],
     pub accepted: u64,
     pub updates: u64,
     pub rejected: u64,
@@ -40,7 +53,7 @@ impl Default for Learner {
     fn default() -> Self {
         Self {
             enabled: true,
-            offset: [0.0; 2],
+            field: [Node::default(); COLS * ROWS],
             accepted: 0,
             updates: 0,
             rejected: 0,
@@ -69,6 +82,35 @@ fn interior(p: XY, r: [i32; 4]) -> bool {
         && p[1] < r[3] as f64 - 4.0
 }
 impl Learner {
+    /// Bilinear interpolation gives a continuous correction, without snapping
+    /// between cells. Untrained nodes contribute zero rather than extrapolation.
+    pub fn offset_at(&self, base: XY, rect: [i32; 4]) -> XY {
+        let p = normalized(base, rect);
+        let x = p[0].clamp(0.0, 1.0) * (COLS - 1) as f64;
+        let y = p[1].clamp(0.0, 1.0) * (ROWS - 1) as f64;
+        let ix = (x.floor() as usize).min(COLS - 2);
+        let iy = (y.floor() as usize).min(ROWS - 2);
+        let fx = x - ix as f64;
+        let fy = y - iy as f64;
+        let corners = [
+            (ix + iy * COLS, (1.0 - fx) * (1.0 - fy)),
+            (ix + 1 + iy * COLS, fx * (1.0 - fy)),
+            (ix + (iy + 1) * COLS, (1.0 - fx) * fy),
+            (ix + 1 + (iy + 1) * COLS, fx * fy),
+        ];
+        std::array::from_fn(|axis| {
+            corners
+                .iter()
+                .map(|(i, w)| self.field[*i].offset[axis] * w)
+                .sum()
+        })
+    }
+    pub fn coverage(&self) -> (usize, usize) {
+        (
+            self.field.iter().filter(|n| n.trained).count(),
+            self.field.len(),
+        )
+    }
     pub fn reset(&mut self) {
         let enabled = self.enabled;
         *self = Self::default();
@@ -153,89 +195,161 @@ impl Learner {
                 return;
             }
             let label = [target[0] - p.base[0], target[1] - p.base[1]];
+            let position = normalized(p.base, p.rect);
+            let rect = p.rect;
             self.pending = None;
-            self.observe(now, label);
+            self.observe(now, position, label, rect);
         }
     }
-    fn observe(&mut self, now: u32, offset: XY) {
+    fn observe(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
         self.labels
             .retain(|s| now.wrapping_sub(s.time) <= HISTORY_MS);
-        self.labels.push_back(Label { time: now, offset });
-        while self.labels.len() > 9 {
+        self.labels.push_back(Label {
+            time: now,
+            position,
+            offset,
+        });
+        while self.labels.len() > MAX_LABELS {
             self.labels.pop_front();
         }
         self.accepted += 1;
         if self.labels.len() < 5 {
-            self.status = "Gathering 5 consistent clicks";
+            self.status = "Gathering 5 local clicks";
             return;
         }
-        // Exponentially favor recent samples (one-minute half-life).
-        let weight = |s: &Label| 2_f64.powf(-(now.wrapping_sub(s.time) as f64) / 60_000.0);
-        let median: XY = std::array::from_fn(|axis| {
-            let mut values: Vec<_> = self
+        let before = self.field;
+        let mut proposed = before;
+        let mut agreed = false;
+        for (index, node) in proposed.iter_mut().enumerate() {
+            let center = [
+                (index % COLS) as f64 / (COLS - 1) as f64,
+                (index / COLS) as f64 / (ROWS - 1) as f64,
+            ];
+            let influence = spatial_weight(position, center);
+            if influence == 0.0 {
+                continue;
+            }
+            // Independent recent neighborhoods prevent left/right corrections
+            // from fighting each other in a single global outlier calculation.
+            let nearby: Vec<_> = self
                 .labels
                 .iter()
-                .map(|s| (s.offset[axis], weight(s)))
+                .rev()
+                .filter(|s| spatial_weight(s.position, center) > 0.0)
+                .take(9)
+                .map(|s| {
+                    (
+                        s,
+                        spatial_weight(s.position, center)
+                            * 2_f64.powf(-(now.wrapping_sub(s.time) as f64) / 60_000.0),
+                    )
+                })
                 .collect();
-            values.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let half = values.iter().map(|v| v.1).sum::<f64>() * 0.5;
-            let mut sum = 0.0;
-            for (value, w) in values {
-                sum += w;
-                if sum >= half {
-                    return value;
-                }
+            if nearby.len() < 5 {
+                continue;
             }
-            unreachable!()
-        });
-        let agreeing: Vec<_> = self
-            .labels
-            .iter()
-            .filter(|s| distance(s.offset, median) <= CONSENSUS_RADIUS)
-            .collect();
-        let agreeing_weight = agreeing.iter().map(|s| weight(s)).sum::<f64>();
-        if agreeing.len() < 5
-            || agreeing_weight < self.labels.iter().map(weight).sum::<f64>() * 0.6
-            || distance(offset, median) > CONSENSUS_RADIUS
-        {
-            self.status = "Waiting for consistent corrections";
+            let median = weighted_median(&nearby);
+            let inliers: Vec<_> = nearby
+                .iter()
+                .filter(|(s, _)| distance(s.offset, median) <= CONSENSUS_RADIUS)
+                .collect();
+            let total = inliers.iter().map(|(_, w)| w).sum::<f64>();
+            if inliers.len() < 5
+                || total < nearby.iter().map(|(_, w)| w).sum::<f64>() * 0.6
+                || distance(offset, median) > CONSENSUS_RADIUS
+            {
+                continue;
+            }
+            let target = bounded(
+                std::array::from_fn(|axis| {
+                    inliers.iter().map(|(s, w)| s.offset[axis] * w).sum::<f64>() / total
+                }),
+                MAX_OFFSET,
+            );
+            let step = bounded(
+                std::array::from_fn(|axis| (target[axis] - node.offset[axis]) * 0.15 * influence),
+                MAX_STEP,
+            );
+            node.offset = bounded(
+                std::array::from_fn(|axis| node.offset[axis] + step[axis]),
+                MAX_OFFSET,
+            );
+            node.trained = true;
+            agreed = true;
+        }
+        // Bound the spatial gradient as well as the displacement. In screen
+        // pixels each partial derivative is <= 0.25, so this residual map cannot
+        // fold or reverse directions, even on a small or negative-origin screen.
+        if !field_is_stable(&proposed, rect) {
+            self.status = "Skipped: correction would distort map";
             return;
         }
-        let target = bounded(
-            std::array::from_fn(|axis| {
-                agreeing
-                    .iter()
-                    .map(|s| s.offset[axis] * weight(s))
-                    .sum::<f64>()
-                    / agreeing_weight
-            }),
-            MAX_OFFSET,
-        );
-        let step = bounded(
-            std::array::from_fn(|axis| (target[axis] - self.offset[axis]) * 0.15),
-            MAX_STEP,
-        );
-        self.offset = bounded(
-            std::array::from_fn(|axis| self.offset[axis] + step[axis]),
-            MAX_OFFSET,
-        );
-        if distance(step, [0.0; 2]) > 0.01 {
+        self.field = proposed;
+        if before
+            .iter()
+            .zip(proposed)
+            .any(|(a, b)| distance(a.offset, b.offset) > 0.01)
+        {
             self.updates += 1;
         }
-        self.status = "Learning from consistent clicks";
+        self.status = if agreed {
+            "Learning local correction map"
+        } else {
+            "Waiting for consistent local clicks"
+        };
     }
+}
+fn normalized(base: XY, rect: [i32; 4]) -> XY {
+    [
+        (base[0] - rect[0] as f64) / (rect[2] - rect[0]).max(1) as f64,
+        (base[1] - rect[1] as f64) / (rect[3] - rect[1]).max(1) as f64,
+    ]
+}
+fn spatial_weight(a: XY, b: XY) -> f64 {
+    let r = distance(a, b) / LOCAL_RADIUS;
+    if r >= 1.0 {
+        0.0
+    } else {
+        (1.0 - r * r).powi(2)
+    }
+}
+fn weighted_median(samples: &[(&Label, f64)]) -> XY {
+    std::array::from_fn(|axis| {
+        let mut values: Vec<_> = samples.iter().map(|(s, w)| (s.offset[axis], *w)).collect();
+        values.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let half = values.iter().map(|v| v.1).sum::<f64>() * 0.5;
+        let mut sum = 0.0;
+        for (value, weight) in values {
+            sum += weight;
+            if sum >= half {
+                return value;
+            }
+        }
+        unreachable!()
+    })
+}
+fn field_is_stable(field: &[Node; COLS * ROWS], rect: [i32; 4]) -> bool {
+    let dx = (rect[2] - rect[0]) as f64 / (COLS - 1) as f64;
+    let dy = (rect[3] - rect[1]) as f64 / (ROWS - 1) as f64;
+    field.iter().enumerate().all(|(i, n)| {
+        (i % COLS == COLS - 1 || distance(n.offset, field[i + 1].offset) <= dx * 0.25)
+            && (i / COLS == ROWS - 1 || distance(n.offset, field[i + COLS].offset) <= dy * 0.25)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     const RECT: [i32; 4] = [0, 0, 3840, 2160];
+    fn local_offset(l: &Learner) -> XY {
+        l.offset_at([1000.0, 1000.0], RECT)
+    }
     fn click(l: &mut Learner, now: u32, error: XY) {
         let base = [1000.0, 1000.0];
         l.begin(
             now,
             base,
-            [base[0] + l.offset[0], base[1] + l.offset[1]],
+            [base[0] + local_offset(l)[0], base[1] + local_offset(l)[1]],
             1,
             RECT,
         );
@@ -246,15 +360,16 @@ mod tests {
     #[test]
     fn repeated_corrections_converge_without_compounding_and_each_step_is_bounded() {
         let mut l = Learner::default();
-        for n in 0..100 {
-            let old = l.offset;
+        // Peripheral nodes get smaller updates than the directly observed area.
+        for n in 0..400 {
+            let old = local_offset(&l);
             click(&mut l, n * 1000, [30.0, -20.0]);
-            assert!(distance(old, l.offset) <= MAX_STEP + 1e-9);
+            assert!(distance(old, local_offset(&l)) <= MAX_STEP + 1e-9);
             if n < 4 {
-                assert_eq!(l.offset, [0.0; 2]);
+                assert_eq!(local_offset(&l), [0.0; 2]);
             }
         }
-        assert!(distance(l.offset, [30.0, -20.0]) < 0.1);
+        assert!(distance(local_offset(&l), [30.0, -20.0]) < 0.1);
     }
     #[test]
     fn outlier_cannot_move_established_offset_and_recent_posture_changes_replace_old_labels() {
@@ -262,13 +377,13 @@ mod tests {
         for n in 0..30 {
             click(&mut l, n * 1000, [20.0, 0.0]);
         }
-        let old = l.offset;
+        let old = local_offset(&l);
         click(&mut l, 31_000, [-70.0, 60.0]);
-        assert_eq!(l.offset, old);
-        for n in 32..132 {
+        assert_eq!(local_offset(&l), old);
+        for n in 32..432 {
             click(&mut l, n * 1000, [-15.0, 10.0]);
         }
-        assert!(distance(l.offset, [-15.0, 10.0]) < 0.1);
+        assert!(distance(local_offset(&l), [-15.0, 10.0]) < 0.1);
     }
     #[test]
     fn drag_long_move_delay_scroll_window_change_and_quick_click_are_rejected() {
@@ -288,7 +403,7 @@ mod tests {
             }
             l.event(250, [1010.0; 2], 2, 1);
             assert_eq!(l.accepted, 0, "case {kind}");
-            assert_eq!(l.offset, [0.0; 2]);
+            assert_eq!(local_offset(&l), [0.0; 2]);
         }
     }
     #[test]
@@ -298,17 +413,17 @@ mod tests {
             click(&mut l, n * 1000, [20.0; 2]);
         }
         l.toggle();
-        let offset = l.offset;
+        let offset = local_offset(&l);
         click(&mut l, 31_000, [0.0; 2]);
-        assert_eq!(l.offset, offset);
+        assert_eq!(local_offset(&l), offset);
         l.toggle();
-        for n in 32..132 {
+        for n in 32..432 {
             click(&mut l, n * 1000, [0.0; 2]);
         }
-        assert!(distance(l.offset, [0.0; 2]) < 0.1);
+        assert!(distance(local_offset(&l), [0.0; 2]) < 0.1);
         l.reset();
         assert_eq!(l.accepted, 0);
-        assert_eq!(l.offset, [0.0; 2]);
+        assert_eq!(local_offset(&l), [0.0; 2]);
     }
     #[test]
     fn clock_wrap_and_stale_history_and_offset_limit() {
@@ -318,9 +433,117 @@ mod tests {
         for n in 0..100 {
             click(&mut l, 1000 + n * 1000, [75.0; 2]);
         }
-        assert!(distance(l.offset, [0.0; 2]) <= MAX_OFFSET + 1e-9);
-        let old = l.offset;
+        assert!(distance(local_offset(&l), [0.0; 2]) <= MAX_OFFSET + 1e-9);
+        let old = local_offset(&l);
         click(&mut l, 500_000, [0.0; 2]);
-        assert_eq!(l.offset, old);
+        assert_eq!(local_offset(&l), old);
+    }
+
+    fn pixels(p: XY, rect: [i32; 4]) -> XY {
+        std::array::from_fn(|a| rect[a] as f64 + p[a] * (rect[a + 2] - rect[a]) as f64)
+    }
+
+    #[test]
+    fn opposite_horizontal_and_vertical_errors_learn_independently() {
+        let mut l = Learner::default();
+        let positions = [
+            [1.0 / 6.0, 0.0],
+            [5.0 / 6.0, 0.0],
+            [1.0 / 6.0, 1.0],
+            [5.0 / 6.0, 1.0],
+        ];
+        let errors = [[25.0, 30.0], [-25.0, 30.0], [25.0, -30.0], [-25.0, -30.0]];
+        for n in 0..600 {
+            let i = n as usize % 4;
+            l.observe(n * 100, positions[i], errors[i], RECT);
+        }
+        for (p, expected) in positions.into_iter().zip(errors) {
+            assert!(distance(l.offset_at(pixels(p, RECT), RECT), expected) < 0.1);
+        }
+        assert_eq!(l.offset_at(pixels([0.5, 0.5], RECT), RECT), [0.0; 2]);
+    }
+
+    #[test]
+    fn interpolation_is_continuous_bounded_and_independent_of_monitor_origin() {
+        let mut l = Learner::default();
+        let shifted = [-3840, -2160, 0, 0];
+        for n in 0..100 {
+            let old = l.field;
+            l.observe(n * 100, [0.5, 0.5], [50.0, -30.0], RECT);
+            for row in 0..21 {
+                for col in 0..31 {
+                    let p = [col as f64 / 30.0, row as f64 / 20.0];
+                    let current = l.offset_at(pixels(p, RECT), RECT);
+                    let previous = Learner {
+                        field: old,
+                        ..Learner::default()
+                    }
+                    .offset_at(pixels(p, RECT), RECT);
+                    assert!(distance(current, previous) <= MAX_STEP + 1e-9);
+                    assert!(distance(current, [0.0; 2]) <= MAX_OFFSET + 1e-9);
+                    assert!(distance(current, l.offset_at(pixels(p, shifted), shifted)) < 1e-9);
+                }
+            }
+        }
+        for row in 1..ROWS - 1 {
+            for col in 1..COLS - 1 {
+                let p = pixels(
+                    [
+                        col as f64 / (COLS - 1) as f64,
+                        row as f64 / (ROWS - 1) as f64,
+                    ],
+                    RECT,
+                );
+                for axis in 0..2 {
+                    let mut a = p;
+                    let mut b = p;
+                    a[axis] -= 1e-6;
+                    b[axis] += 1e-6;
+                    assert!(distance(l.offset_at(a, RECT), l.offset_at(b, RECT)) < 1e-5);
+                }
+            }
+        }
+        let small = [0, 0, 320, 240];
+        // Use a fresh model for another display, as the controller does.
+        let mut small_model = Learner::default();
+        for n in 0..200 {
+            small_model.observe(n * 100, [0.5, 0.5], [75.0, 0.0], small);
+            assert!(field_is_stable(&small_model.field, small));
+        }
+    }
+
+    #[test]
+    fn curved_asymmetric_error_improves_at_held_out_positions() {
+        fn error([x, y]: XY) -> XY {
+            [
+                28.0 * (x - 0.5) + 12.0 * y * y,
+                32.0 * (y - 0.5) + 16.0 * x * y,
+            ]
+        }
+        let mut l = Learner::default();
+        for n in 0..4200 {
+            let i = n as usize % (COLS * ROWS);
+            let p = [
+                (i % COLS) as f64 / (COLS - 1) as f64,
+                (i / COLS) as f64 / (ROWS - 1) as f64,
+            ];
+            l.observe(n * 50, p, error(p), RECT);
+        }
+        let mut before = 0.0;
+        let mut after = 0.0;
+        for row in 0..ROWS - 1 {
+            for col in 0..COLS - 1 {
+                let p = [
+                    (col as f64 + 0.5) / (COLS - 1) as f64,
+                    (row as f64 + 0.5) / (ROWS - 1) as f64,
+                ];
+                before += distance(error(p), [0.0; 2]).powi(2);
+                after += distance(error(p), l.offset_at(pixels(p, RECT), RECT)).powi(2);
+            }
+        }
+        assert!(
+            after < before * 0.25,
+            "held-out squared errors: {before} -> {after}"
+        );
     }
 }
