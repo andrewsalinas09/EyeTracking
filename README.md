@@ -225,6 +225,57 @@ and the most recent routing result to distinguish input detection from focus iss
 
 ## Validation
 
+### Posture-aware learning research (2026-10-05)
+
+The current learner has no posture input. A read-only hardware probe is available:
+
+```powershell
+cargo run --example pose_probe
+```
+
+The installed ET5 runtime successfully provided gaze origin, head pose (position
+and all three rotation axes), and user position guide. In a five-second probe,
+head pose supplied 160 valid callbacks; gaze origin and position guide each
+supplied 166 callbacks with 161 valid positions. The older normalized-eye-position
+stream reported unsupported. Subscription success and valid callbacks establish
+availability, not pose accuracy or its predictive value for calibration error.
+
+Recommended experiment: record pose synchronized to the gaze sample used for a
+jump, then compare (1) the current spatial map, (2) a regularized continuous
+pose-conditioned residual model, and (3) a persistent bank of small correction
+models with confidence-based switching. Share the general screen correction
+across models; keep each posture's additional correction simple until enough
+data supports spatial detail. All models retain dependence on both screen axes.
+Allow recurring postures to emerge instead of forcing exactly six clusters.
+Use both pose and click prediction error for model selection, resist uncertain
+switches, and preserve old models when learning a new posture. This is a proposal,
+not a demonstrated best algorithm for this tracker.
+
+Evaluate chronologically: predict before training on each click, hold out entire
+posture visits/sessions, and check independent target dots. Measure median/p90
+error, correction distance, false switches, and recovery after changing posture.
+Click labels can reflect deliberate gaze compensation and are not ground truth;
+the short-correction gate also excludes many large errors. Existing logs omit
+pose and cannot retrospectively establish posture-dependent accuracy.
+
+Relevant primary research:
+
+- [Sugano et al., ECCV 2008](https://doi.org/10.1007/978-3-540-88690-7_49):
+  incremental gaze estimation from clicks with head-pose clustering. The webcam
+  setting supports the approach, not direct accuracy claims for ET5 residuals.
+- [WebGazer, IJCAI 2016](https://www.ijcai.org/Proceedings/16/Papers/540.pdf):
+  interaction-supervised regularized regression.
+- [FAZE, ICCV 2019](https://arxiv.org/abs/1905.01941): few-shot neural adaptation
+  depends on pretrained image representations and meta-learning; a few local
+  XY/click samples are not equivalent training data.
+- [EyeO, 2023](https://arxiv.org/abs/2307.15039): users' deliberate gaze
+  compensation can confound implicit calibration labels.
+- [Pose-Robust Calibration, BMVC 2025](https://arxiv.org/abs/2508.10268):
+  testing across varied head poses matters; its mobile/image setting differs
+  from this desktop residual-calibration problem.
+
+### Build and checks
+
 ```powershell
 cargo test
 cargo clippy --all-targets -- -D warnings
