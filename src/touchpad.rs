@@ -24,8 +24,9 @@ impl Landing {
         land
     }
 }
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct Frame {
+    pub contacts: Option<usize>,
     pub land: bool,
     pub multi: bool,
     pub scroll_start: bool,
@@ -241,6 +242,7 @@ impl Device {
         let trigger = self.gesture.frame(&contacts, blocked || button);
         let land = self.landing.frame(contacts.len(), blocked || button);
         Some(Frame {
+            contacts: Some(contacts.len()),
             land,
             multi,
             scroll_start: trigger,

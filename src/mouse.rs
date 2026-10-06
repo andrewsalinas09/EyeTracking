@@ -3,6 +3,8 @@
 //! Without contact reports, raw physical motion retains its burst fallback. This window
 //! runs on its own thread so full-screen preview painting cannot stall input.
 //! Precision touchpads can have a null hDevice; that is deliberately accepted.
+//! Touch landings also issue a tagged zero-distance mouse update: SetCursorPos
+//! alone need not refresh the visible pointer until the next physical movement.
 use crate::{
     calibration::{Display, Model, Report},
     tobii::State,
@@ -27,6 +29,19 @@ use windows_sys::Win32::{
 
 const IDLE_MS: u32 = 300;
 const TOGGLE: u32 = WM_APP + 1;
+const LANDING_TAG: usize = 0x4559454c;
+fn cursor_refresh_input() -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dwFlags: MOUSEEVENTF_MOVE,
+                dwExtraInfo: LANDING_TAG,
+                ..unsafe { zeroed() }
+            },
+        },
+    }
+}
 #[derive(Default)]
 struct Burst {
     last: Option<u32>,
@@ -359,6 +374,9 @@ impl Context {
             return;
         }
         let mouse = input.data.mouse;
+        if mouse.ulExtraInformation == LANDING_TAG as u32 {
+            return; // Our display refresh is not physical correction or a new burst.
+        }
         let moved = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
             let next = (mouse.lLastX, mouse.lLastY);
             self.absolute.insert(input.header.hDevice as usize, next) != Some(next)
@@ -439,9 +457,14 @@ impl Context {
         }
         let [x, y] = cfg.screen_point(point.unwrap());
         if SetCursorPos(x, y) != 0 {
+            let refreshed = source != "touch"
+                || SendInput(1, &cursor_refresh_input(), size_of::<INPUT>() as i32) == 1;
             self.jumps += 1;
             cfg.learning.record_jump(source, true);
             self.last_error.clear();
+            if !refreshed {
+                self.last_error = "Landed, but Windows rejected the pointer refresh".into();
+            }
             // Save pre-adaptation gaze at the jump. Later eye motion is not a label.
             let base = cfg.base_point(point.unwrap());
             let rect = cfg.display.rect;
@@ -674,6 +697,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn touch_refresh_is_tagged_zero_motion_without_buttons_or_wheel() {
+        let input = cursor_refresh_input();
+        assert_eq!(input.r#type, INPUT_MOUSE);
+        let mouse = unsafe { input.Anonymous.mi };
+        assert_eq!((mouse.dx, mouse.dy, mouse.mouseData), (0, 0, 0));
+        assert_eq!(mouse.dwFlags, MOUSEEVENTF_MOVE);
+        assert_eq!(mouse.dwExtraInfo, LANDING_TAG);
+    }
     #[test]
     fn every_burst_jumps_once_including_tiny_moves_and_long_fine_control() {
         let mut b = Burst::default();

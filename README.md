@@ -108,6 +108,18 @@ a 300 ms idle interval. Once contact mode is detected, all raw pointer movement
 is refinement only (including a separate mouse), preventing duplicate jumps from
 the touchpad's emulated mouse packets. Disconnecting all recognized touchpads
 restores the fallback. There is no travel or fixation threshold for landing.
+Touch landings follow the cursor warp with a tagged, zero-distance mouse update
+to request an immediate pointer refresh. This adds no button, wheel, or positional
+delta, and the input receiver ignores that tag for learning and rearming.
+
+`cargo run --example touch_probe` records 60 seconds of passive contact/mouse
+timing and cursor position/visibility changes to `recordings/touch-probe-*.jsonl`.
+It does not inject input. Use it to distinguish contact delivery from visible
+pointer behavior; compare its first contact with the normal learning journal's
+`jump` events (`source: touch` versus `motion`). These local traces are ignored
+by Git. The first hardware trace delivered touch landings 0.6–1.1 seconds before
+subsequent physical mouse motion, despite a reported delay in visible landing;
+the pointer-refresh change still needs participant confirmation.
 
 A click-through status panel shows ARMED, FINE CONTROL, PAUSED or NO GAZE, plus
 learning and recording status. It starts hidden; **Ctrl+Alt+F6** shows or hides it
