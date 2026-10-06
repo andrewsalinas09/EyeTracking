@@ -21,6 +21,22 @@ struct GazePoint {
     xy: [f32; 2],
 }
 #[repr(C)]
+struct HeadPose {
+    timestamp_us: i64,
+    position_validity: u32,
+    position: [f32; 3],
+    rotation_validity: [u32; 3],
+    rotation: [f32; 3],
+}
+#[repr(C)]
+struct GazeOrigin {
+    timestamp_us: i64,
+    left_validity: u32,
+    left: [f32; 3],
+    right_validity: u32,
+    right: [f32; 3],
+}
+#[repr(C)]
 #[derive(Default)]
 struct Version {
     major: i32,
@@ -46,6 +62,9 @@ pub struct Sample {
     pub received: Instant,
 }
 pub struct State {
+    pub pose_status: String,
+    pub heads: VecDeque<crate::pose::Timed<crate::pose::Head>>,
+    pub eyes: VecDeque<crate::pose::Timed<crate::pose::Eyes>>,
     pub status: String,
     pub version: String,
     pub samples: VecDeque<Sample>,
@@ -55,6 +74,9 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            pose_status: "Pose not connected".into(),
+            heads: VecDeque::new(),
+            eyes: VecDeque::new(),
             status: "Connecting to Tobii…".into(),
             version: String::new(),
             samples: VecDeque::new(),
@@ -64,6 +86,23 @@ impl Default for State {
     }
 }
 impl State {
+    pub fn evidence(&self, sample: Sample) -> crate::pose::Evidence {
+        let now = Instant::now();
+        let mut head = crate::pose::nearest(&self.heads, sample.timestamp_us, now);
+        if let Some(p) = &mut head {
+            p.skew_us = p.timestamp_us - sample.timestamp_us;
+        }
+        let mut eye_origin = crate::pose::nearest(&self.eyes, sample.timestamp_us, now);
+        if let Some(p) = &mut eye_origin {
+            p.skew_us = p.timestamp_us - sample.timestamp_us;
+        }
+        crate::pose::Evidence {
+            gaze_timestamp_us: sample.timestamp_us,
+            raw_gaze: sample.xy.map(f64::from),
+            head,
+            eye_origin,
+        }
+    }
     pub fn hz(&self) -> f64 {
         let now = Instant::now();
         let recent: Vec<_> = self
@@ -84,6 +123,7 @@ impl State {
 }
 
 struct Engine {
+    pose_unsubscribers: Vec<Destroy>,
     _library: Library,
     api: Handle,
     device: Handle,
@@ -123,6 +163,7 @@ impl Engine {
         let device_create = symbol!("tobii_device_create", DeviceCreate);
         let subscribe = symbol!("tobii_gaze_point_subscribe", Subscribe);
         let mut engine = Self {
+            pose_unsubscribers: Vec::new(),
             api_destroy: symbol!("tobii_api_destroy", Destroy),
             device_destroy: symbol!("tobii_device_destroy", Destroy),
             unsubscribe: symbol!("tobii_gaze_point_unsubscribe", Destroy),
@@ -167,6 +208,32 @@ impl Engine {
             "Subscribe to gaze",
         )?;
         engine.subscribed = true;
+        {
+            let mut state = shared.lock().unwrap();
+            state.heads.clear();
+            state.eyes.clear();
+        }
+        type PoseCallback = unsafe extern "C" fn(*const c_void, *mut c_void);
+        type PoseSubscribe = unsafe extern "C" fn(Handle, PoseCallback, *mut c_void) -> u32;
+        let mut available = Vec::new();
+        for (name, callback) in [
+            ("head_pose", receive_head as PoseCallback),
+            ("gaze_origin", receive_origin as PoseCallback),
+        ] {
+            let subscribe = engine
+                ._library
+                .get::<PoseSubscribe>(format!("tobii_{name}_subscribe\0").as_bytes());
+            let unsubscribe = engine
+                ._library
+                .get::<Destroy>(format!("tobii_{name}_unsubscribe\0").as_bytes());
+            if let (Ok(sub), Ok(unsub)) = (subscribe, unsubscribe) {
+                if sub(engine.device, callback, Arc::as_ptr(shared) as *mut c_void) == 0 {
+                    engine.pose_unsubscribers.push(*unsub);
+                    available.push(name);
+                }
+            }
+        }
+        shared.lock().unwrap().pose_status = format!("Pose streams: {}", available.join(", "));
         shared.lock().unwrap().status = "Connected".into();
         Ok(engine)
     }
@@ -187,6 +254,9 @@ impl Drop for Engine {
     fn drop(&mut self) {
         unsafe {
             if !self.device.is_null() {
+                for unsubscribe in &self.pose_unsubscribers {
+                    unsubscribe(self.device);
+                }
                 if self.subscribed {
                     (self.unsubscribe)(self.device);
                 }
@@ -201,6 +271,52 @@ impl Drop for Engine {
 unsafe extern "C" fn receive_url(url: *const c_char, context: *mut c_void) {
     if !url.is_null() && !context.is_null() {
         (*(context as *mut Vec<CString>)).push(CStr::from_ptr(url).to_owned());
+    }
+}
+unsafe extern "C" fn receive_head(data: *const c_void, context: *mut c_void) {
+    if data.is_null() || context.is_null() {
+        return;
+    }
+    let p = &*data.cast::<HeadPose>();
+    if let Ok(mut state) = (&*context.cast::<Mutex<State>>()).lock() {
+        let valid = p.position_validity == 1
+            && p.rotation_validity.iter().all(|v| *v == 1)
+            && p.position
+                .iter()
+                .chain(p.rotation.iter())
+                .all(|v| v.is_finite());
+        crate::pose::push(
+            &mut state.heads,
+            p.timestamp_us,
+            valid.then_some(crate::pose::Head {
+                timestamp_us: p.timestamp_us,
+                skew_us: 0,
+                position: p.position.map(f64::from),
+                rotation: p.rotation.map(f64::from),
+            }),
+        );
+    }
+}
+unsafe extern "C" fn receive_origin(data: *const c_void, context: *mut c_void) {
+    if data.is_null() || context.is_null() {
+        return;
+    }
+    let p = &*data.cast::<GazeOrigin>();
+    if let Ok(mut state) = (&*context.cast::<Mutex<State>>()).lock() {
+        let left = (p.left_validity == 1 && p.left.iter().all(|v| v.is_finite()))
+            .then_some(p.left.map(f64::from));
+        let right = (p.right_validity == 1 && p.right.iter().all(|v| v.is_finite()))
+            .then_some(p.right.map(f64::from));
+        crate::pose::push(
+            &mut state.eyes,
+            p.timestamp_us,
+            (left.is_some() || right.is_some()).then_some(crate::pose::Eyes {
+                timestamp_us: p.timestamp_us,
+                skew_us: 0,
+                left,
+                right,
+            }),
+        );
     }
 }
 unsafe extern "C" fn receive_gaze(point: *const GazePoint, context: *mut c_void) {

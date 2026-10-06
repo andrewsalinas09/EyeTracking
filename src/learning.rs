@@ -26,6 +26,7 @@ struct Node {
 }
 
 struct Attempt {
+    evidence: Option<crate::pose::Evidence>,
     time: u32,
     base: XY,
     landing: XY,
@@ -133,7 +134,7 @@ impl Learner {
             log.record(json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
                 "base":p.base, "landing":p.landing, "target":p.down.map(|(_,target)|target),
                 "last":p.last, "path_px":p.path, "accepted":accepted, "updated":updated,
-                "status":reason, "field":self.field.as_slice()}));
+                "status":reason, "field":self.field.as_slice(), "evidence":p.evidence}));
         }
     }
     /// Bilinear interpolation gives a continuous correction, without snapping
@@ -206,6 +207,7 @@ impl Learner {
             return;
         }
         self.pending = Some(Attempt {
+            evidence: None,
             time: now,
             base,
             landing,
@@ -217,6 +219,11 @@ impl Learner {
             drag_path: 0.0,
         });
         self.status = "Watching correction + click";
+    }
+    pub fn attach_evidence(&mut self, evidence: crate::pose::Evidence) {
+        if let Some(p) = &mut self.pending {
+            p.evidence = Some(evidence);
+        }
     }
     /// Flags are Win32 raw mouse left-down/up bits 1/2. All other buttons and
     /// scrolling invalidate the attempt. Commit only on release to reject drags.
@@ -268,7 +275,7 @@ impl Learner {
             self.record_attempt(&attempt, true, self.updates != previous, self.status);
         }
     }
-    fn observe(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
+    pub fn observe(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
         self.labels
             .retain(|s| now.wrapping_sub(s.time) <= HISTORY_MS);
         self.labels.push_back(Label {

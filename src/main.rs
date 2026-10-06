@@ -4,6 +4,7 @@ mod gaze_dot;
 mod learning;
 mod learning_log;
 mod mouse;
+mod pose;
 mod preview;
 mod scroll;
 mod tobii;

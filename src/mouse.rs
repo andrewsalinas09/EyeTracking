@@ -383,7 +383,19 @@ impl Context {
         if !self.burst.input(now, moved, blocked) {
             return;
         }
-        let point = self.gaze();
+        let evidence = {
+            let state = self.state.lock().unwrap();
+            state
+                .samples
+                .back()
+                .filter(|s| {
+                    state.status == "Connected"
+                        && s.valid
+                        && s.received.elapsed() <= Duration::from_millis(200)
+                })
+                .map(|s| state.evidence(*s))
+        };
+        let point = evidence.map(|e| e.raw_gaze);
         cfg.learning.cancel("Replaced by next jump");
         if !self.display_ok || point.is_none() {
             self.misses += 1;
@@ -406,6 +418,9 @@ impl Context {
             if !modifiers && GetCursorPos(&mut actual) != 0 && actual.x == x && actual.y == y {
                 cfg.learning
                     .begin(now, base, [x as f64, y as f64], surface_at(actual), rect);
+                if let Some(evidence) = evidence {
+                    cfg.learning.attach_evidence(evidence);
+                }
             }
         } else {
             self.misses += 1;

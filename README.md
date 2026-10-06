@@ -227,7 +227,10 @@ and the most recent routing result to distinguish input detection from focus iss
 
 ### Posture-aware learning research (2026-10-05)
 
-The current learner has no posture input. A read-only hardware probe is available:
+The live learner now logs synchronized head pose and eye origins at each gaze
+jump, but its corrections still use the original spatial learner. The nearest
+pose sample must be within 50 ms of the gaze timestamp and recently received;
+invalid or stale samples remain missing. A read-only hardware probe is available:
 
 ```powershell
 cargo run --example pose_probe
@@ -275,6 +278,39 @@ Relevant primary research:
   from this desktop residual-calibration problem.
 
 ### Build and checks
+
+For a guided, known-target comparison, close gaze-preview and run:
+
+```powershell
+cargo run --example posture_trial
+```
+
+Each round pauses on a full-screen posture instruction with no target visible.
+Change posture and press Enter to confirm; Space cannot dismiss that screen.
+Look at each dot, press Space, and hold gaze for 1.4 seconds. There are three
+13-target rounds: upright, leaned back, then upright again. The first nine targets
+of each of the first two rounds train the models. Four intermediate targets in
+each round and the entire return visit are held out. Each prediction is recorded
+before training; repeated gaze frames contribute to one robust target estimate,
+not dozens of independent training labels. At least 20 matched gaze/head samples
+and median fixation scatter below 70 pixels are required. Raw synchronized
+samples, predictions, and per-round mean/median/p90 error are saved after each
+capture in `recordings/posture-trial-*.json`. Q saves partial progress and exits;
+Escape is reserved for the automation tool's stop shortcut. Captures cancel on
+focus loss. Recorded round confirmations support protocol review; a completed
+run remains `pending_review` until the participant confirms the procedure was
+followed. Invalid runs belong in `recordings/invalid/` and must not be scored.
+
+The trial compares fixed calibration, the existing local spatial learner, shared
+affine ridge regression, continuous pose-conditioned ridge regression, and a
+prototype bank of affine experts selected by head-pose distance. The bank retains
+up to six experts; it is a simple experimental baseline, not the full proposed
+probabilistic switching system. Features use 50 mm position and 0.2 radian rotation
+scales, regularization is fixed before testing, and correction magnitude is capped
+at 80 pixels. Experimental models never control the pointer. The spatial learner
+receives the same known-target training labels without the normal click gates;
+this is a controlled calibration comparison, not a simulation of normal clicking.
+One short session cannot establish generalization to other days or postures.
 
 ```powershell
 cargo test
