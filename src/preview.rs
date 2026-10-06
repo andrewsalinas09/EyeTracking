@@ -628,7 +628,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 area.bottom - area.top
             ),
         );
-        label(back.dc,px(30.0),h-px(39.0),px(14.0),dim,"C  Calibrate     R  Results     A  Correction     F11  Full screen     M  Display     T  Trail     Esc  Close");
+        label(back.dc,px(30.0),h-px(39.0),px(14.0),dim,"C  Calibrate   R  Results   L  Learning map   A  Correction   F11  Full screen   M  Display   Esc  Close");
         if !app.notice.is_empty() {
             label(back.dc, px(30.0), px(98.0), px(14.0), dim, &app.notice);
         }
@@ -832,6 +832,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                                 if let Some(mouse) = &a.mouse {
                                     mouse.toggle();
                                 }
+                            }
+                            0x4C => {
+                                a.notice = match a.mouse.as_ref().map(|m| m.open_learning_map()) {
+                                    Some(Ok(())) => "Opening saved learning map in your browser. L refreshes the snapshot.".into(),
+                                    Some(Err(e)) => e,
+                                    None => "Mouse controller is unavailable.".into(),
+                                };
                             }
                             0x54 => a.trail = !a.trail,
                             0x47 => a.targets = !a.targets,

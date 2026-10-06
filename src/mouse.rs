@@ -91,6 +91,12 @@ impl Controller {
             calibrating: false,
             learning: crate::learning::Learner::default(),
         }));
+        {
+            let mut cfg = config.lock().unwrap();
+            let display = cfg.display.clone();
+            let model = cfg.model.clone();
+            cfg.learning.start_recording(&display, model.as_ref());
+        }
         let cfg = config.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || unsafe {
@@ -138,7 +144,7 @@ impl Controller {
                 rect[0] + 20,
                 rect[1] + 20,
                 820,
-                262,
+                292,
                 null_mut(),
                 null_mut(),
                 instance,
@@ -209,6 +215,11 @@ impl Controller {
         let mut cfg = self.config.lock().unwrap();
         cfg.model = enabled.then(|| report.model.clone());
         cfg.learning.reset();
+        cfg.learning
+            .record_context(&cfg.display, cfg.model.as_ref());
+    }
+    pub fn open_learning_map(&self) -> Result<(), String> {
+        self.config.lock().unwrap().learning.open_map()
     }
     pub fn offset(&self, display: &Display, base: [f32; 2]) -> [f32; 2] {
         let cfg = self.config.lock().unwrap();
@@ -232,6 +243,8 @@ impl Controller {
             cfg.display = r.display.clone();
             cfg.model = r.metrics.recommend.then(|| r.model.clone());
         }
+        cfg.learning
+            .record_context(&cfg.display, cfg.model.as_ref());
     }
 }
 impl Drop for Controller {
@@ -444,10 +457,10 @@ impl Context {
         let learning = &cfg.learning;
         let (trained, total) = learning.coverage();
         let dot_state = if self.dot_visible { "ON" } else { "OFF" };
-        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls",
+        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls\n{}",
             self.jumps, self.misses, if cfg.model.is_some() { "calibrated" } else { "raw gaze" },
             self.motions, self.last_error, if learning.enabled { "ON" } else { "FROZEN" },
-            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.gestures));
+            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.gestures, learning.recording_status()));
         r.left += 12;
         r.top += 8;
         DrawTextW(dc, text.as_ptr(), -1, &mut r, DT_LEFT | DT_NOPREFIX);
@@ -512,6 +525,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 cfg.learning.toggle();
             } else {
                 cfg.learning.reset();
+                cfg.learning
+                    .record_context(&cfg.display, cfg.model.as_ref());
             }
             InvalidateRect(hwnd, null(), 0);
             0
@@ -568,6 +583,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_ERASEBKGND => 1,
         WM_DESTROY => {
+            ctx.config
+                .lock()
+                .unwrap()
+                .learning
+                .cancel("Skipped: app closed");
             UnregisterHotKey(hwnd, 1);
             UnregisterHotKey(hwnd, 2);
             UnregisterHotKey(hwnd, 3);

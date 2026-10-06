@@ -32,6 +32,7 @@ handles device access and retries connection failures.
 | W / Ctrl+Alt+F8 | Toggle gaze mouse (Ctrl+Alt+F8 works globally) |
 | Ctrl+Alt+F9 | Freeze/resume continuous learning; keep the current correction map |
 | Ctrl+Alt+F10 | Reset the learned correction map and click history |
+| L | Open a snapshot of saved continuous learning in your browser |
 | F11 | Toggle full screen |
 | M | Move preview to the next display |
 | T | Toggle gaze trail |
@@ -156,10 +157,37 @@ The HUD shows accepted clicks, applied updates, trained grid points out of 35,
 and the most recent learning status. Ctrl+Alt+F9 freezes learning without removing
 the correction map; Ctrl+Alt+F10 resets
 it. Starting calibration or toggling its base correction resets adaptation too.
-This first implementation learns for the current run: restart starts fresh rather
-than applying a previous sitting position. It does not rewrite the saved model or
-record browsing contents. Click targets are heuristics, so improved real-world
+Correction learns for the current run: restart starts fresh rather than applying
+a previous sitting position. Learning evidence is saved across runs (see below).
+It does not rewrite the saved model or record browsing contents.
+Click targets are heuristics, so improved real-world
 accuracy still needs to be evaluated during use.
+
+### Learning history and map
+
+Learning is evaluated on each eligible left-button release, rather than at a
+fixed interval or on each gaze sample. Five consistent nearby labels are required
+before a region can change. The HUD counts eligible clicks separately from clicks
+that actually changed the correction field.
+
+Every resolved learning attempt is appended to `recordings/learning-*.jsonl`.
+Each record includes its timestamp, physical display rectangle, base gaze estimate
+(after fixed calibration, before online correction), actual pointer landing,
+click target when available, last cursor position, travel, eligibility, update
+outcome, reason, and the resulting 7×5 field. Context records include the display
+and fixed calibration model. Resets begin new periods without deleting history.
+Only attempts initiated by an eligible gaze jump are recorded, not the full gaze
+stream or every desktop click. Saving and report generation run on a separate
+writer thread; the HUD reports save errors. Events are flushed after each record.
+The data stays local and recordings are excluded from Git.
+
+Press **L in the preview** to generate and open the current session's standalone
+HTML map. It shows base gaze → landing → click, the learned field, outcome filters,
+separate calibration periods, magnified arrows, and clickable point/row details.
+It is a snapshot: press L again for an updated snapshot. A matching HTML snapshot
+is also saved at normal exit. Use **Open saved JSONL…** to inspect another run.
+Both files remain under `recordings/`; the online learner does not automatically
+reload old corrections. Data from runs before this feature cannot be recovered.
 
 ### Gaze-directed scrolling
 
@@ -197,6 +225,7 @@ and the most recent routing result to distinguish input detection from focus iss
 ```powershell
 cargo test
 cargo clippy --all-targets -- -D warnings
+node tests/learning_view.cjs
 cargo run --release -- --probe 8
 ```
 

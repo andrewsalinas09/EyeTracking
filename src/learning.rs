@@ -3,6 +3,8 @@
 //! otherwise applying each residual repeatedly would create a feedback drift.
 //! Spatial errors cannot be represented by one global offset: learn a local
 //! residual field and interpolate it continuously at the base gaze position.
+use serde::Serialize;
+use serde_json::json;
 use std::collections::VecDeque;
 
 type XY = [f64; 2];
@@ -17,7 +19,7 @@ const ROWS: usize = 5;
 const LOCAL_RADIUS: f64 = 0.30;
 const MAX_LABELS: usize = 256;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize)]
 struct Node {
     offset: XY,
     trained: bool,
@@ -48,6 +50,9 @@ pub struct Learner {
     pub status: &'static str,
     pending: Option<Attempt>,
     labels: VecDeque<Label>,
+    recorder: Option<crate::learning_log::Recorder>,
+    recording_error: String,
+    epoch: u64,
 }
 impl Default for Learner {
     fn default() -> Self {
@@ -60,6 +65,9 @@ impl Default for Learner {
             status: "Waiting for jump + click",
             pending: None,
             labels: VecDeque::new(),
+            recorder: None,
+            recording_error: String::new(),
+            epoch: 0,
         }
     }
 }
@@ -82,6 +90,52 @@ fn interior(p: XY, r: [i32; 4]) -> bool {
         && p[1] < r[3] as f64 - 4.0
 }
 impl Learner {
+    pub fn start_recording(
+        &mut self,
+        display: &crate::calibration::Display,
+        model: Option<&crate::calibration::Model>,
+    ) {
+        let result = std::env::current_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|p| crate::learning_log::Recorder::start(&p.join("recordings")));
+        match result {
+            Ok(recorder) => {
+                self.recorder = Some(recorder);
+                self.record_context(display, model);
+            }
+            Err(e) => self.recording_error = format!("Learning save unavailable: {e}"),
+        }
+    }
+    pub fn record_context(
+        &self,
+        display: &crate::calibration::Display,
+        model: Option<&crate::calibration::Model>,
+    ) {
+        if let Some(log) = &self.recorder {
+            log.record(json!({"kind":"context", "schema":1, "epoch":self.epoch,
+                "display":display, "base_model":model, "field":self.field.as_slice(),
+                "coordinates":"physical desktop pixels; base gaze is after fixed calibration"}));
+        }
+    }
+    pub fn open_map(&self) -> Result<(), String> {
+        self.recorder
+            .as_ref()
+            .ok_or_else(|| self.recording_status())?
+            .open()
+    }
+    pub fn recording_status(&self) -> String {
+        self.recorder
+            .as_ref()
+            .map_or_else(|| self.recording_error.clone(), |r| r.status())
+    }
+    fn record_attempt(&self, p: &Attempt, accepted: bool, updated: bool, reason: &str) {
+        if let Some(log) = &self.recorder {
+            log.record(json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
+                "base":p.base, "landing":p.landing, "target":p.down.map(|(_,target)|target),
+                "last":p.last, "path_px":p.path, "accepted":accepted, "updated":updated,
+                "status":reason, "field":self.field.as_slice()}));
+        }
+    }
     /// Bilinear interpolation gives a continuous correction, without snapping
     /// between cells. Untrained nodes contribute zero rather than extrapolation.
     pub fn offset_at(&self, base: XY, rect: [i32; 4]) -> XY {
@@ -112,18 +166,29 @@ impl Learner {
         )
     }
     pub fn reset(&mut self) {
+        self.cancel("Skipped: calibration reset");
         let enabled = self.enabled;
+        let recorder = self.recorder.take();
+        let error = std::mem::take(&mut self.recording_error);
+        let epoch = self.epoch + 1;
         *self = Self::default();
         self.enabled = enabled;
+        self.recorder = recorder;
+        self.recording_error = error;
+        self.epoch = epoch;
+        if let Some(log) = &self.recorder {
+            log.record(json!({"kind":"reset", "epoch":epoch, "field":self.field.as_slice()}));
+        }
     }
     pub fn toggle(&mut self) {
         self.enabled = !self.enabled;
         self.cancel("Learning frozen");
     }
     pub fn cancel(&mut self, reason: &'static str) {
-        if self.pending.take().is_some() {
+        if let Some(p) = self.pending.take() {
             self.rejected += 1;
             self.status = reason;
+            self.record_attempt(&p, false, false, reason);
         }
     }
     pub fn expire(&mut self, now: u32) {
@@ -197,8 +262,10 @@ impl Learner {
             let label = [target[0] - p.base[0], target[1] - p.base[1]];
             let position = normalized(p.base, p.rect);
             let rect = p.rect;
-            self.pending = None;
+            let attempt = self.pending.take().unwrap();
+            let previous = self.updates;
             self.observe(now, position, label, rect);
+            self.record_attempt(&attempt, true, self.updates != previous, self.status);
         }
     }
     fn observe(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
@@ -288,7 +355,7 @@ impl Learner {
         if before
             .iter()
             .zip(proposed)
-            .any(|(a, b)| distance(a.offset, b.offset) > 0.01)
+            .any(|(a, b)| a.offset != b.offset)
         {
             self.updates += 1;
         }
@@ -437,6 +504,53 @@ mod tests {
         let old = local_offset(&l);
         click(&mut l, 500_000, [0.0; 2]);
         assert_eq!(local_offset(&l), old);
+    }
+
+    #[test]
+    fn saved_attempts_preserve_base_landing_target_outcome_and_reset_history() {
+        let directory = std::env::temp_dir().join(format!(
+            "gaze-attempt-test-{}-{}",
+            std::process::id(),
+            crate::learning_log::timestamp_ms()
+        ));
+        let mut l = Learner {
+            recorder: Some(crate::learning_log::Recorder::start(&directory).unwrap()),
+            ..Learner::default()
+        };
+        for n in 0..6 {
+            click(&mut l, n * 1000, [20.0, 10.0]);
+        }
+        l.begin(7000, [1000.0; 2], [1000.0; 2], 1, RECT);
+        l.event(7100, [1020.0; 2], 1024, 1);
+        l.reset();
+        click(&mut l, 8000, [-10.0, 0.0]);
+        drop(l);
+        let files: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let path = files
+            .iter()
+            .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .unwrap();
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(records.len(), 9);
+        assert_eq!(records[0]["base"], json!([1000.0, 1000.0]));
+        assert_eq!(records[0]["target"], json!([1020.0, 1010.0]));
+        assert_eq!(records[0]["updated"], false);
+        assert_eq!(records[4]["updated"], true);
+        assert_ne!(records[5]["landing"], records[5]["base"]);
+        assert_eq!(records[6]["accepted"], false);
+        assert_eq!(records[7]["kind"], "reset");
+        assert_eq!(records[8]["epoch"], 1);
+        for file in files {
+            std::fs::remove_file(file).unwrap();
+        }
+        std::fs::remove_dir(directory).unwrap();
     }
 
     fn pixels(p: XY, rect: [i32; 4]) -> XY {
