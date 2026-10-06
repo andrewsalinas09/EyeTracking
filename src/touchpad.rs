@@ -1,6 +1,7 @@
 //! Precision Touchpad scrolling may bypass mouse wheel hooks entirely. Observe
 //! digitizer reports passively, using the HID descriptor parser from TrackpadGlass.
-//! Detect parallel two-finger travel; never synthesize or consume touch gestures.
+//! Detect first finger contact and parallel two-finger travel passively. Contact
+//! state, not a movement timeout, owns rearming: resting fingers cannot jump twice.
 use std::{
     collections::HashMap,
     mem::{offset_of, size_of, zeroed},
@@ -11,6 +12,24 @@ use windows_sys::Win32::{Devices::HumanInterfaceDevice::*, Foundation::*, UI::In
 struct Contact {
     id: u32,
     xy: [f64; 2],
+}
+#[derive(Default)]
+struct Landing {
+    occupied: bool,
+}
+impl Landing {
+    fn frame(&mut self, contacts: usize, blocked: bool) -> bool {
+        let land = !self.occupied && contacts == 1 && !blocked;
+        self.occupied = contacts != 0;
+        land
+    }
+}
+#[derive(Default)]
+pub struct Frame {
+    pub land: bool,
+    pub multi: bool,
+    pub scroll_start: bool,
+    pub scrolling: bool,
 }
 #[derive(Default)]
 struct Gesture {
@@ -68,6 +87,8 @@ struct Device {
     slots: Vec<u16>,
     ranges: [[f64; 2]; 2],
     gesture: Gesture,
+    landing: Landing,
+    seen: bool,
 }
 unsafe fn value(
     pp: PHIDP_PREPARSED_DATA,
@@ -170,11 +191,25 @@ impl Device {
             slots,
             ranges,
             gesture: Gesture::default(),
+            landing: Landing::default(),
+            seen: false,
         })
     }
-    unsafe fn frame(&mut self, report: &mut [u8], blocked: bool) -> Option<(bool, bool, bool)> {
+    fn uncertain(&mut self) -> Frame {
+        // A malformed/palm report is not evidence of lift-off. Require an
+        // explicit empty contact frame before permitting another landing.
+        self.landing.occupied = true;
+        self.gesture.used = true;
+        self.gesture.scrolling = false;
+        Frame {
+            multi: true,
+            ..Frame::default()
+        }
+    }
+    unsafe fn frame(&mut self, report: &mut [u8], blocked: bool) -> Option<Frame> {
         let pp = self.pp.as_ptr() as PHIDP_PREPARSED_DATA;
         let count = value(pp, 0x0d, 0, 0x54, report)? as usize;
+        self.seen = true;
         // This parser handles parallel reports, as exposed by this Magic Trackpad.
         if count > self.slots.len() {
             self.gesture.used = true;
@@ -188,9 +223,7 @@ impl Device {
                 continue;
             }
             if !flags.contains(&0x47) {
-                self.gesture.used = true;
-                self.gesture.scrolling = false;
-                return Some((true, false, false));
+                return Some(self.uncertain());
             }
             let id = value(pp, 0x0d, slot, 0x51, report)?;
             let x = value(pp, 1, slot, 0x30, report)? as f64;
@@ -206,7 +239,13 @@ impl Device {
         }
         let multi = contacts.len() >= 2;
         let trigger = self.gesture.frame(&contacts, blocked || button);
-        Some((multi, trigger, self.gesture.scrolling))
+        let land = self.landing.frame(contacts.len(), blocked || button);
+        Some(Frame {
+            land,
+            multi,
+            scroll_start: trigger,
+            scrolling: self.gesture.scrolling,
+        })
     }
 }
 #[derive(Default)]
@@ -214,8 +253,15 @@ pub struct Touchpad {
     devices: HashMap<usize, Option<Device>>,
     pub reports: u64,
     pub gestures: u64,
+    pub landings: u64,
 }
 impl Touchpad {
+    pub fn contact_mode(&self) -> bool {
+        self.devices.values().flatten().any(|d| d.seen)
+    }
+    pub fn occupied(&self) -> bool {
+        self.devices.values().flatten().any(|d| d.landing.occupied)
+    }
     pub unsafe fn register(hwnd: HWND) -> bool {
         let device = RAWINPUTDEVICE {
             usUsagePage: 0x0d,
@@ -228,7 +274,7 @@ impl Touchpad {
     pub fn removed(&mut self, device: usize) {
         self.devices.remove(&device);
     }
-    pub unsafe fn input(&mut self, l: LPARAM, blocked: bool) -> Option<(bool, bool, bool)> {
+    pub unsafe fn input(&mut self, l: LPARAM, blocked: bool) -> Option<Vec<Frame>> {
         let mut header: RAWINPUTHEADER = zeroed();
         let mut hs = size_of::<RAWINPUTHEADER>() as u32;
         if GetRawInputData(
@@ -245,7 +291,7 @@ impl Touchpad {
         let mut size = 0;
         GetRawInputData(l as HRAWINPUT, RID_INPUT, null_mut(), &mut size, hs);
         if size < hs + 8 || size > 65536 {
-            return Some((false, false, false));
+            return Some(Vec::new());
         }
         let mut buf = vec![0u64; (size as usize).div_ceil(8)];
         if GetRawInputData(
@@ -256,7 +302,7 @@ impl Touchpad {
             hs,
         ) != size
         {
-            return Some((false, false, false));
+            return Some(Vec::new());
         }
         let bytes = std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, size as usize);
         let data = offset_of!(RAWINPUT, data);
@@ -265,34 +311,60 @@ impl Touchpad {
         let offset = data + offset_of!(RAWHID, bRawData);
         if report_size == 0 || offset > bytes.len() || count > (bytes.len() - offset) / report_size
         {
-            return Some((false, false, false));
+            return Some(Vec::new());
         }
         let Some(dev) = self
             .devices
             .entry(header.hDevice as usize)
             .or_insert_with(|| Device::new(header.hDevice))
         else {
-            return Some((false, false, false));
+            return Some(Vec::new());
         };
-        let (mut multi, mut trigger) = (false, false);
-        let mut scrolling = false;
+        let mut frames = Vec::new();
         for report in bytes[offset..offset + report_size * count].chunks_exact_mut(report_size) {
-            if let Some((m, t, s)) = dev.frame(report, blocked) {
-                self.reports += 1;
-                multi |= m;
-                trigger |= t;
-                scrolling = s;
-            }
+            let frame = dev
+                .frame(report, blocked)
+                .unwrap_or_else(|| dev.uncertain());
+            self.reports += 1;
+            self.gestures += u64::from(frame.scroll_start);
+            self.landings += u64::from(frame.land);
+            frames.push(frame);
         }
-        if trigger {
-            self.gestures += 1;
-        }
-        Some((multi, trigger, scrolling))
+        Some(frames)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contact_jumps_once_until_all_fingers_lift_without_a_time_threshold() {
+        let mut l = Landing::default();
+        assert!(l.frame(1, false));
+        for _ in 0..10000 {
+            assert!(!l.frame(1, false));
+        }
+        assert!(!l.frame(0, false));
+        assert!(l.frame(1, false));
+        assert!(!l.frame(2, false));
+        assert!(!l.frame(1, false));
+        assert!(!l.frame(0, false));
+        assert!(l.frame(1, false));
+    }
+    #[test]
+    fn blocked_or_multi_contact_requires_full_lift_even_after_unblocking() {
+        for contacts in [1, 2, 3] {
+            let mut l = Landing::default();
+            assert!(!l.frame(contacts, true));
+            assert!(!l.frame(1, false));
+            l.frame(0, false);
+            assert!(l.frame(1, false));
+        }
+        let mut l = Landing::default();
+        assert!(!l.frame(2, false));
+        assert!(!l.frame(1, false));
+        l.frame(0, false);
+        assert!(l.frame(1, false));
+    }
     fn pair(y: f64) -> [Contact; 2] {
         [
             Contact {

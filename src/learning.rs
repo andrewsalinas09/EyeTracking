@@ -91,6 +91,11 @@ fn interior(p: XY, r: [i32; 4]) -> bool {
         && p[1] < r[3] as f64 - 4.0
 }
 impl Learner {
+    pub fn record_jump(&self, source: &str, success: bool) {
+        if let Some(log) = &self.recorder {
+            log.record(json!({"kind":"jump", "source":source, "success":success}));
+        }
+    }
     pub fn start_recording(
         &mut self,
         display: &crate::calibration::Display,

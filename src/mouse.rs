@@ -1,4 +1,6 @@
-//! Raw physical motion drives a deterministic burst state machine. This window
+//! Touchpad contact owns landing/rearming when a supported pad is detected;
+//! raw motion is then refinement only, including after long stationary contact.
+//! Without contact reports, raw physical motion retains its burst fallback. This window
 //! runs on its own thread so full-screen preview painting cannot stall input.
 //! Precision touchpads can have a null hDevice; that is deliberately accepted.
 use crate::{
@@ -285,6 +287,13 @@ unsafe fn surface_at(point: POINT) -> usize {
     GetAncestor(WindowFromPoint(point), GA_ROOT) as usize
 }
 impl Context {
+    fn armed(&self, now: u32) -> bool {
+        if self.touchpad.contact_mode() {
+            !self.touchpad.occupied()
+        } else {
+            self.burst.armed(now)
+        }
+    }
     fn gaze(&self) -> Option<[f64; 2]> {
         let state = self.state.lock().unwrap();
         if state.status != "Connected" {
@@ -313,20 +322,25 @@ impl Context {
                 },
             )
         };
-        if let Some((multi, trigger, scrolling)) = self
+        if let Some(frames) = self
             .touchpad
             .input(l, !allowed || modifiers || buttons_down())
         {
             crate::scroll::update(allowed, point, GetTickCount());
-            if multi {
-                self.burst.last = Some(GetTickCount());
-                self.config
-                    .lock()
-                    .unwrap()
-                    .learning
-                    .cancel("Skipped: two-finger gesture");
+            for frame in frames {
+                if frame.multi {
+                    self.burst.last = Some(GetTickCount());
+                    self.config
+                        .lock()
+                        .unwrap()
+                        .learning
+                        .cancel("Skipped: two-finger gesture");
+                }
+                if frame.land {
+                    self.jump(GetTickCount(), modifiers, "touch");
+                }
+                crate::scroll::touchpad(frame.multi, frame.scroll_start, frame.scrolling);
             }
-            crate::scroll::touchpad(multi, trigger, scrolling);
             return;
         }
         let mut input: RAWINPUT = zeroed();
@@ -379,8 +393,23 @@ impl Context {
                 surface_at(cursor),
             );
         }
-        let blocked = buttons_down() || flags != 0 || !self.enabled || cfg.calibrating;
+        let blocked = buttons_down()
+            || flags != 0
+            || !self.enabled
+            || cfg.calibrating
+            || modifiers
+            || !self.display_ok
+            || GetTickCount().wrapping_sub(now) > 100
+            || self.touchpad.contact_mode();
         if !self.burst.input(now, moved, blocked) {
+            return;
+        }
+        drop(cfg);
+        self.jump(now, modifiers, "motion");
+    }
+    unsafe fn jump(&mut self, now: u32, modifiers: bool, source: &str) {
+        let mut cfg = self.config.lock().unwrap();
+        if !self.enabled || cfg.calibrating || modifiers || buttons_down() {
             return;
         }
         let evidence = {
@@ -400,16 +429,18 @@ impl Context {
         if !self.display_ok || point.is_none() {
             self.misses += 1;
             self.last_error = if self.display_ok {
-                "No fresh gaze at movement"
+                "No fresh gaze at landing"
             } else {
                 "Calibrated display changed"
             }
             .into();
+            cfg.learning.record_jump(source, false);
             return;
         }
         let [x, y] = cfg.screen_point(point.unwrap());
         if SetCursorPos(x, y) != 0 {
             self.jumps += 1;
+            cfg.learning.record_jump(source, true);
             self.last_error.clear();
             // Save pre-adaptation gaze at the jump. Later eye motion is not a label.
             let base = cfg.base_point(point.unwrap());
@@ -424,6 +455,7 @@ impl Context {
             }
         } else {
             self.misses += 1;
+            cfg.learning.record_jump(source, false);
             self.last_error = "Windows rejected cursor movement".into();
         }
     }
@@ -465,18 +497,27 @@ impl Context {
             "NO GAZE"
         } else if buttons_down() {
             "DRAG / CLICK"
-        } else if self.burst.armed(GetTickCount()) {
-            "ARMED - move to jump"
+        } else if self.armed(GetTickCount()) {
+            if self.touchpad.contact_mode() {
+                "ARMED - touch to land"
+            } else {
+                "ARMED - move to jump"
+            }
         } else {
             "FINE CONTROL"
         };
         let learning = &cfg.learning;
         let (trained, total) = learning.coverage();
         let dot_state = if self.dot_visible { "ON" } else { "OFF" };
-        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n300 ms rearm  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} two-finger scrolls\n{}",
+        let mode = if self.touchpad.contact_mode() {
+            "Touch to land; lift to rearm"
+        } else {
+            "Motion: 300 ms rearm"
+        };
+        let text = wide(&format!("{state}    |    Ctrl+Alt+F8 pause/resume\n{mode}  |  {} jumps  |  {} missed  |  {}\n{} raw movements | Dot {dot_state}: Ctrl+Alt+F7 | {}\nLearn {}: {} clicks, {} updates | spatial {trained}/{total}\nCtrl+Alt+F9 freeze | Ctrl+Alt+F10 reset | {}\n{}\nTouchpad: {} reports, {} landings, {} scrolls\n{}",
             self.jumps, self.misses, if cfg.model.is_some() { "calibrated" } else { "raw gaze" },
             self.motions, self.last_error, if learning.enabled { "ON" } else { "FROZEN" },
-            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.gestures, learning.recording_status()));
+            learning.accepted, learning.updates, learning.status, crate::scroll::status(), self.touchpad.reports, self.touchpad.landings, self.touchpad.gestures, learning.recording_status()));
         r.left += 12;
         r.top += 8;
         DrawTextW(dc, text.as_ptr(), -1, &mut r, DT_LEFT | DT_NOPREFIX);
@@ -577,7 +618,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             };
             let now = GetTickCount();
             crate::scroll::update(ctx.enabled, point, now);
-            let ready = point.is_some() && ctx.enabled && !buttons_down() && ctx.burst.armed(now);
+            let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT]
+                .iter()
+                .any(|k| GetAsyncKeyState(*k as i32) < 0);
+            let ready =
+                point.is_some() && ctx.enabled && !buttons_down() && !modifiers && ctx.armed(now);
             ctx.dot.update(point.filter(|_| ctx.dot_visible), ready);
             0
         }

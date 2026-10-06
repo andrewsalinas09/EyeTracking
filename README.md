@@ -95,10 +95,19 @@ display available for preview. Mouse control is an optional mode described below
 
 Run `cargo run --release -- --mouse` to start enabled, or press W in the preview.
 Turn off Tobii Experience's own **Warp on mouse move** to avoid two controllers.
-After 300 ms without pointer activity, the very first nonzero raw mouse/trackpad
-delta triggers one jump. There is no minimum travel, speed, direction, gaze-distance,
-or fixation threshold. Continued movement provides normal fine control. The next
-300 ms pause rearms it. Button presses, dragging and scrolling reset that pause.
+On a supported touchpad, the first confident single-finger contact jumps to gaze
+immediately, without movement. Slide to refine, then click. Lift all fingers to
+rearm; resting your finger never rearms, regardless of how long you pause. A
+contact that starts while paused, dragging, holding a modifier, or using multiple
+fingers cannot cause a delayed jump when that condition ends. Two-finger scrolling
+keeps its existing gaze-focus behavior. If the second finger arrives after the
+first, the first contact can already have landed before scrolling starts.
+
+Until a supported contact report is received, the old first-motion fallback uses
+a 300 ms idle interval. Once contact mode is detected, all raw pointer movement
+is refinement only (including a separate mouse), preventing duplicate jumps from
+the touchpad's emulated mouse packets. Disconnecting all recognized touchpads
+restores the fallback. There is no travel or fixation threshold for landing.
 
 A click-through status panel shows ARMED, FINE CONTROL, PAUSED or NO GAZE, plus
 learning and recording status. It starts hidden; **Ctrl+Alt+F6** shows or hides it
@@ -110,15 +119,16 @@ including while the preview is minimized or mouse jumps are paused. Its center
 uses the same calibrated position as a jump. The dot is nine physical pixels
 wide, takes no focus and passes clicks through. It hides on tracking loss or
 during calibration, so it never shows an old position as live gaze.
-Black means the next movement is armed to jump. Orange means movement will stay
-in fine control, including the 300 ms rearm interval, held buttons, and paused
+Black means the next touch is armed to land (or the next movement in fallback
+mode). Orange means fine control while fingers remain down, held buttons or
+modifiers, the fallback's 300 ms rearm interval, and paused
 mouse assistance. Color refreshes every 16 ms, even if the gaze position is still.
 **Ctrl+Alt+F7** shows/hides just the desktop dot from any app; mouse jumps,
 gaze scrolling, and learning continue unchanged. The HUD shows Dot ON/OFF.
 The dot starts visible each time the app launches.
 Raw Input accepts precision touchpads with null device handles, and cursor warps
 do not feed back as physical motion. The latest gaze sample must be valid and no
-older than 200 ms. A missing sample consumes that movement attempt with a visible
+older than 200 ms. A missing sample consumes that landing attempt with a visible
 reason; it cannot create an unexpected delayed jump when tracking recovers.
 
 Mouse mapping stays on the saved calibration's display, independently of the
@@ -139,7 +149,7 @@ Eligible clicks start 80–1500 ms after the jump and release within 500 ms; the
 correction is at most 120 physical pixels, with at most 240 pixels total travel.
 Scrolling, other buttons, keyboard modifiers, crossing top-level windows, edge
 clamping, dragging over 4 pixels, and delayed input invalidate the attempt. These
-are learning filters only; the first-motion jump still has no travel threshold.
+are learning filters only; touch-to-land still has no travel threshold.
 
 The learner maintains a 7-column by 5-row field of local XY corrections over the
 base gaze position. Both horizontal and vertical errors can vary with both screen
