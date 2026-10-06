@@ -43,6 +43,7 @@ impl Landing {
 #[derive(Default, serde::Serialize)]
 pub struct Frame {
     pub contacts: Option<usize>,
+    pub started: bool,
     pub armed: bool,
     pub multi: bool,
     pub scroll_start: bool,
@@ -256,10 +257,12 @@ impl Device {
             contacts.push(Contact { id, xy });
         }
         let multi = contacts.len() >= 2;
+        let started = !contacts.is_empty() && !self.landing.occupied;
         let trigger = self.gesture.frame(&contacts, blocked || button);
         self.landing.frame(contacts.len(), blocked || button);
         Some(Frame {
             contacts: Some(contacts.len()),
+            started,
             armed: self.landing.pending,
             multi,
             scroll_start: trigger,

@@ -1,6 +1,7 @@
 //! A supported touchpad arms on contact and jumps on the first raw movement.
 //! Taps never jump; further motion refines until all fingers lift to rearm.
-//! Without contact reports, raw physical motion retains its burst fallback. This window
+//! Route real device handles to independent mouse bursts even with a touchpad
+//! connected; only Windows' null-device touchpad motion uses contact state. This window
 //! runs on its own thread so full-screen preview painting cannot stall input.
 //! Precision touchpads can have a null hDevice; that is deliberately accepted.
 use crate::{
@@ -27,6 +28,20 @@ use windows_sys::Win32::{
 
 const IDLE_MS: u32 = 300;
 const TOGGLE: u32 = WM_APP + 1;
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PointerSource {
+    Touchpad,
+    Mouse(usize),
+}
+impl PointerSource {
+    fn from_raw(device: usize, contact_mode: bool) -> Self {
+        if device == 0 && contact_mode {
+            Self::Touchpad
+        } else {
+            Self::Mouse(device)
+        }
+    }
+}
 fn recent_click(last: Option<u32>, now: u32, interval: u32) -> bool {
     last.is_some_and(|t| now.wrapping_sub(t) < interval)
 }
@@ -128,7 +143,8 @@ impl Controller {
                 state,
                 config: cfg,
                 enabled,
-                burst: Burst::default(),
+                bursts: HashMap::new(),
+                source: PointerSource::Touchpad,
                 last_click: None,
                 absolute: HashMap::new(),
                 jumps: 0,
@@ -164,7 +180,7 @@ impl Controller {
             let device = RAWINPUTDEVICE {
                 usUsagePage: 1,
                 usUsage: 2,
-                dwFlags: RIDEV_INPUTSINK,
+                dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
                 hwndTarget: hwnd,
             };
             if RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8 as u32) == 0
@@ -271,7 +287,8 @@ struct Context {
     state: Arc<Mutex<State>>,
     config: Arc<Mutex<Config>>,
     enabled: bool,
-    burst: Burst,
+    bursts: HashMap<usize, Burst>,
+    source: PointerSource,
     last_click: Option<u32>,
     absolute: HashMap<usize, (i32, i32)>,
     jumps: u64,
@@ -293,10 +310,9 @@ unsafe fn surface_at(point: POINT) -> usize {
 }
 impl Context {
     fn armed(&self, now: u32) -> bool {
-        if self.touchpad.contact_mode() {
-            self.touchpad.armed()
-        } else {
-            self.burst.armed(now)
+        match self.source {
+            PointerSource::Touchpad => self.touchpad.armed(),
+            PointerSource::Mouse(device) => self.bursts.get(&device).is_none_or(|b| b.armed(now)),
         }
     }
     fn gaze(&self) -> Option<[f64; 2]> {
@@ -336,8 +352,10 @@ impl Context {
         ) {
             crate::scroll::update(allowed, point, GetTickCount());
             for frame in frames {
+                if frame.started || frame.scroll_start {
+                    self.source = PointerSource::Touchpad;
+                }
                 if frame.multi {
-                    self.burst.last = Some(GetTickCount());
                     self.config
                         .lock()
                         .unwrap()
@@ -375,6 +393,11 @@ impl Context {
         }
         let now = GetMessageTime() as u32;
         let flags = mouse.Anonymous.Anonymous.usButtonFlags;
+        let source =
+            PointerSource::from_raw(input.header.hDevice as usize, self.touchpad.contact_mode());
+        if moved || flags != 0 {
+            self.source = source;
+        }
         if flags & 0x03ff != 0 {
             self.last_click = Some(now);
         }
@@ -409,12 +432,13 @@ impl Context {
             || modifiers
             || !self.display_ok
             || GetTickCount().wrapping_sub(now) > 100;
-        let contact_mode = self.touchpad.contact_mode();
-        let jump = if contact_mode {
-            self.burst.input(now, moved, true);
-            self.touchpad.motion(moved, blocked)
-        } else {
-            self.burst.input(now, moved, blocked)
+        let jump = match source {
+            PointerSource::Touchpad => self.touchpad.motion(moved, blocked),
+            PointerSource::Mouse(device) => self
+                .bursts
+                .entry(device)
+                .or_default()
+                .input(now, moved, blocked),
         };
         if !jump {
             return;
@@ -423,7 +447,11 @@ impl Context {
         self.jump(
             now,
             modifiers,
-            if contact_mode { "slide" } else { "motion" },
+            if source == PointerSource::Touchpad {
+                "slide"
+            } else {
+                "mouse"
+            },
         );
     }
     unsafe fn jump(&mut self, now: u32, modifiers: bool, source: &str) {
@@ -519,7 +547,7 @@ impl Context {
         {
             "DRAG / CLICK"
         } else if self.armed(GetTickCount()) {
-            if self.touchpad.contact_mode() {
+            if self.source == PointerSource::Touchpad {
                 "ARMED - slide to land"
             } else {
                 "ARMED - move to jump"
@@ -530,7 +558,7 @@ impl Context {
         let learning = &cfg.learning;
         let (trained, total) = learning.coverage();
         let dot_state = if self.dot_visible { "ON" } else { "OFF" };
-        let mode = if self.touchpad.contact_mode() {
+        let mode = if self.source == PointerSource::Touchpad {
             "Slide to land; lift to rearm"
         } else {
             "Motion: 300 ms rearm"
@@ -574,6 +602,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     match msg {
         WM_INPUT_DEVICE_CHANGE if w == GIDC_REMOVAL as usize => {
             ctx.touchpad.removed(l as usize);
+            ctx.bursts.remove(&(l as usize));
+            ctx.absolute.remove(&(l as usize));
             0
         }
         crate::scroll::SCROLLED => {
@@ -583,7 +613,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 .unwrap()
                 .learning
                 .cancel("Skipped: scrolling");
-            ctx.burst.last = Some(w as u32);
+            if let PointerSource::Mouse(device) = ctx.source {
+                ctx.bursts.entry(device).or_default().last = Some(w as u32);
+            }
             0
         }
         WM_INPUT => {
@@ -626,7 +658,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 .unwrap()
                 .learning
                 .cancel("Mouse paused/resumed");
-            ctx.burst = Burst::default();
+            ctx.bursts.clear();
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -701,6 +733,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn physical_mouse_keeps_its_own_burst_when_touchpad_is_present() {
+        assert_eq!(PointerSource::from_raw(0, true), PointerSource::Touchpad);
+        assert_eq!(PointerSource::from_raw(0, false), PointerSource::Mouse(0));
+        assert_eq!(
+            PointerSource::from_raw(123, true),
+            PointerSource::Mouse(123)
+        );
+        let mut bursts = HashMap::<usize, Burst>::new();
+        for (device, now, expected) in [
+            (123, 0, true),
+            (123, 1, false),
+            (456, 2, true),
+            (123, 301, true),
+        ] {
+            let PointerSource::Mouse(device) = PointerSource::from_raw(device, true) else {
+                panic!("Mouse must not consume touchpad contact state")
+            };
+            assert_eq!(
+                bursts.entry(device).or_default().input(now, true, false),
+                expected
+            );
+        }
+    }
     #[test]
     fn double_click_protection_uses_system_interval_and_handles_clock_wrap() {
         assert!(!recent_click(None, 0, 500));

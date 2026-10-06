@@ -108,16 +108,19 @@ keeps its existing gaze-focus behavior. If the second finger arrives after the
 first and you slide before it arrives, that slide may land before scrolling starts.
 
 Until a supported contact report is received, the old first-motion fallback uses
-a 300 ms idle interval. Once contact mode is detected, raw pointer movement can
-land only once during an eligible single-finger contact; otherwise it is normal
-fine control. A separate mouse by itself does not gaze-jump in this mode.
-Disconnecting all recognized touchpads restores the fallback.
+a 300 ms idle interval. Once contact mode is detected, Windows' null-device
+touchpad pointer packets can land only once per eligible single-finger contact.
+Physical mice with their own device handles always keep independent 300 ms
+movement bursts, even while a touchpad is connected. The dot and HUD follow the
+last-used pointer source; starting a fresh touch selects touchpad feedback.
+Disconnecting all recognized touchpads restores motion fallback for null-device
+input as well. Double-click protection applies to both mouse and touchpad.
 
 `cargo run --example touch_probe` records 60 seconds of passive contact/mouse
 timing and cursor position/visibility changes to `recordings/touch-probe-*.jsonl`.
 It does not inject input. Use it to distinguish contact delivery from visible
 pointer behavior; compare its first contact with the normal learning journal's
-`jump` events (`source: slide` versus `motion`). These local traces are ignored
+`jump` events (`source: slide` versus `mouse`). These local traces are ignored
 by Git. Earlier `source: touch` records belong to the retired contact-only mode.
 
 A click-through status panel shows ARMED, FINE CONTROL, PAUSED or NO GAZE, plus
