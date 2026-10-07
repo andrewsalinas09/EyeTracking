@@ -187,64 +187,73 @@ fn draw_session(pm: &mut Pixmap, session: &Session, area: RECT, origin: POINT, s
         );
     }
 }
-fn draw_report(pm: &mut Pixmap, report: &Report, area: RECT, origin: POINT, scale: f32) {
-    for cap in &report.training {
-        let target = map_point(cap.target.map(|v| v as f32), area, origin);
-        for sample in &cap.retained {
-            let p = map_point(sample.map(|v| v as f32), area, origin);
-            circle(pm, p[0], p[1], 1.5 * scale, [131, 154, 176, 65], None);
+fn report_maps(w: f32, h: f32, size: [f64; 2]) -> [[f32; 4]; 2] {
+    let width = (w - 96.) / 2.;
+    let height = (width * (size[1] / size[0]) as f32).min(h - 440.);
+    let width = height * (size[0] / size[1]) as f32;
+    [
+        [32., 226., width, height],
+        [w / 2. + 16., 226., width, height],
+    ]
+}
+fn report_point(p: [f64; 2], rect: [f32; 4], scale: f32) -> [f32; 2] {
+    [
+        (rect[0] + p[0] as f32 * rect[2]) * scale,
+        (rect[1] + p[1] as f32 * rect[3]) * scale,
+    ]
+}
+fn target_error(p: [f64; 2], target: [f64; 2], size: [f64; 2]) -> f64 {
+    ((p[0] - target[0]) * size[0]).hypot((p[1] - target[1]) * size[1])
+}
+fn draw_report(pm: &mut Pixmap, report: &Report, scale: f32) {
+    let maps = report_maps(
+        pm.width() as f32 / scale,
+        pm.height() as f32 / scale,
+        report.display.size(),
+    );
+    for (i, rect) in maps.into_iter().enumerate() {
+        for (a, b) in [
+            ([0., 0.], [1., 0.]),
+            ([1., 0.], [1., 1.]),
+            ([1., 1.], [0., 1.]),
+            ([0., 1.], [0., 0.]),
+        ] {
+            line(
+                pm,
+                report_point(a, rect, scale),
+                report_point(b, rect, scale),
+                [68, 85, 100, 255],
+                scale,
+            );
         }
-        for sample in &cap.rejected {
-            let p = map_point(sample.map(|v| v as f32), area, origin);
-            circle(pm, p[0], p[1], 2.0 * scale, [235, 90, 100, 120], None);
+        for cap in &report.validation {
+            let target = report_point(cap.target, rect, scale);
+            let p = if i == 0 {
+                cap.mean
+            } else {
+                report.model.apply(cap.mean)
+            };
+            let point = report_point(p.map(|v| v.clamp(0., 1.)), rect, scale);
+            let improved = target_error(p, cap.target, report.display.size())
+                < target_error(cap.mean, cap.target, report.display.size());
+            let color = if i == 0 {
+                [248, 181, 99, 255]
+            } else if improved {
+                [96, 232, 229, 255]
+            } else {
+                [245, 118, 126, 255]
+            };
+            line(pm, point, target, color, scale);
+            circle(pm, point[0], point[1], 4. * scale, color, None);
+            circle(
+                pm,
+                target[0],
+                target[1],
+                7. * scale,
+                [234, 243, 250, 255],
+                Some(scale),
+            );
         }
-        circle(
-            pm,
-            target[0],
-            target[1],
-            4.0 * scale,
-            [112, 136, 157, 210],
-            Some(scale),
-        );
-    }
-    for cap in &report.validation {
-        let target = map_point(cap.target.map(|v| v as f32), area, origin);
-        let raw = map_point(cap.mean.map(|v| v as f32), area, origin);
-        let corrected = map_point(report.model.apply(cap.mean).map(|v| v as f32), area, origin);
-        line(pm, raw, target, [248, 181, 99, 160], scale);
-        line(pm, corrected, target, [96, 232, 229, 210], scale);
-        circle(
-            pm,
-            raw[0],
-            raw[1],
-            7.0 * scale,
-            [248, 181, 99, 255],
-            Some(2.0 * scale),
-        );
-        circle(
-            pm,
-            corrected[0],
-            corrected[1],
-            5.0 * scale,
-            [96, 232, 229, 255],
-            None,
-        );
-        circle(
-            pm,
-            target[0],
-            target[1],
-            12.0 * scale,
-            [234, 243, 250, 255],
-            Some(scale),
-        );
-        circle(
-            pm,
-            target[0],
-            target[1],
-            2.0 * scale,
-            [234, 243, 250, 255],
-            None,
-        );
     }
 }
 
@@ -486,13 +495,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
         draw_session(&mut back.pixmap, session, area, origin, scale);
     }
     if report_visible {
-        draw_report(
-            &mut back.pixmap,
-            app.report.as_ref().unwrap(),
-            area,
-            origin,
-            scale,
-        );
+        draw_report(&mut back.pixmap, app.report.as_ref().unwrap(), scale);
     }
     // tiny-skia RGBA -> Windows DIB BGRA; copy into the persistent backbuffer.
     let target = std::slice::from_raw_parts_mut(back.bits, (w * h * 4) as usize);
@@ -571,7 +574,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
             px(25.0),
             px(30.0),
             white,
-            &format!("{} correction · independent check", report.model.kind),
+            &format!("{} correction · accuracy map", report.model.kind),
         );
         label(
             back.dc,
@@ -601,6 +604,77 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 m.corrected_worst_target_px
             ),
         );
+        label(
+            back.dc,
+            px(30.),
+            px(134.),
+            px(20.),
+            if correction_active {
+                teal
+            } else {
+                rgb(248, 181, 99)
+            },
+            if correction_active {
+                "Correction ON · this map is applied to gaze control"
+            } else if m.recommend {
+                "Correction OFF · checks passed; use Correction: On to apply"
+            } else {
+                "Correction OFF · mixed results; this is a preview of the fitted map"
+            },
+        );
+        let detail = if let Some(previous) = &report.previous_metrics {
+            format!("Saved checks replayed · previous map {:.1} px → refitted {:.1} px · no new gaze collected", previous.corrected_mean_px, m.corrected_mean_px)
+        } else {
+            format!(
+                "{} fitting points · {} separate check points · errors in full-display pixels",
+                report.training.len(),
+                report.validation.len()
+            )
+        };
+        label(back.dc, px(30.), px(166.), px(14.), dim, &detail);
+        let maps = report_maps(w as f32 / scale, h as f32 / scale, report.display.size());
+        for (i, rect) in maps.into_iter().enumerate() {
+            label(
+                back.dc,
+                px(rect[0]),
+                px(196.),
+                px(18.),
+                white,
+                if i == 0 {
+                    "Before · Tobii output"
+                } else {
+                    "After · fitted correction"
+                },
+            );
+            for cap in &report.validation {
+                let p = if i == 0 {
+                    cap.mean
+                } else {
+                    report.model.apply(cap.mean)
+                };
+                let error = target_error(p, cap.target, report.display.size());
+                let raw = target_error(cap.mean, cap.target, report.display.size());
+                let color = if i == 0 {
+                    rgb(248, 181, 99)
+                } else if error < raw {
+                    teal
+                } else {
+                    rgb(245, 118, 126)
+                };
+                let x = (rect[0] + cap.target[0] as f32 * rect[2] - 22.)
+                    .clamp(rect[0] + 2., rect[0] + rect[2] - 52.);
+                let y =
+                    (rect[1] + cap.target[1] as f32 * rect[3] + 9.).min(rect[1] + rect[3] - 15.);
+                label(
+                    back.dc,
+                    px(x),
+                    px(y),
+                    px(12.),
+                    color,
+                    &format!("{error:.0} px"),
+                );
+            }
+        }
         if m.corner_errors.is_empty() {
             label(back.dc,px(30.),h-px(213.),px(14.),rgb(248,181,99),"Corners were not checked in this older calibration. Recalibrate for full-screen coverage.");
         } else {
@@ -624,7 +698,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 );
             }
         }
-        label(back.dc,px(30.0),h-px(184.0),px(14.0),white,"White: target    Orange: original    Mint: corrected    Grey: fitting samples    Red: outliers");
+        label(back.dc,px(30.0),h-px(184.0),px(14.0),white,"Ring: target · Dot: measured mean · Mint: improved · Red: worse · Off-screen means shown at edge");
         label(
             back.dc,
             px(30.0),
@@ -636,7 +710,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 if m.recommend {
                     "Improvement passed the checks."
                 } else {
-                    "No reliable improvement; keep the original mapping."
+                    "Mixed results; automatic correction was not enabled."
                 },
                 if correction_active { "ON" } else { "OFF" }
             ),

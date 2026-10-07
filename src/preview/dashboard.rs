@@ -27,6 +27,7 @@ const REARM_EDIT: u32 = 121;
 const REARM_APPLY: u32 = 122;
 const TRACKPAD_LABEL: u32 = 123;
 const TRACKPAD_EDIT: u32 = 124;
+const REFIT: u32 = 125;
 const ALL: &[u32] = &[
     HOME,
     PREVIEW,
@@ -52,6 +53,7 @@ const ALL: &[u32] = &[
     TRACKPAD_LABEL,
     TRACKPAD_EDIT,
     REARM_APPLY,
+    REFIT,
 ];
 const BG: u32 = 0x211913;
 const CARD: u32 = 0x2e251d;
@@ -189,13 +191,14 @@ pub unsafe fn refresh(hwnd: HWND) {
         (REARM_LABEL, "Mouse (ms)"),
         (TRACKPAD_LABEL, "Trackpad (ms)"),
         (REARM_APPLY, "Apply"),
+        (REFIT, "Refit saved points"),
     ] {
         caption(
             hwnd,
             id,
             text,
             match id {
-                RESULTS => report,
+                RESULTS | REFIT => report,
                 HISTORY | RESET | REARM_APPLY => available,
                 _ => true,
             },
@@ -320,6 +323,7 @@ pub unsafe fn layout(hwnd: HWND) {
             (DISPLAY, 652., h - 94., 130., 38.),
             (TRAIL, 24., h - 48., 130., 34.),
             (TARGETS, 166., h - 48., 170., 34.),
+            (REFIT, 348., h - 48., 170., 34.),
         ]);
     }
     for &id in ALL {
@@ -777,6 +781,26 @@ pub unsafe fn command(hwnd: HWND, id: u32) {
             });
             layout(hwnd);
             SetFocus(hwnd);
+        }
+        REFIT => {
+            APP.with(|a| {
+                if let Some(a) = a.borrow_mut().as_mut() {
+                    let result = a.report.as_ref().ok_or("No saved calibration.".to_string())
+                        .and_then(Report::refit)
+                        .and_then(|r| { r.save()?; Ok(r) });
+                    match result {
+                        Ok(report) => {
+                            a.correction = report.metrics.recommend;
+                            if let Some(mouse) = &a.mouse { mouse.calibration(false, Some(&report)); }
+                            a.report = Some(report);
+                            a.show_report = true;
+                            a.notice = "Refitted the saved fitting points. Original recording kept; check results are a replay.".into();
+                        }
+                        Err(error) => a.notice = format!("Could not refit: {error}"),
+                    }
+                }
+            });
+            layout(hwnd);
         }
         CALIBRATE => {
             APP.with(|a| {

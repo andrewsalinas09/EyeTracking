@@ -146,6 +146,20 @@ pub struct Model {
     pub kind: String,
     pub coefficients: [Vec<f64>; 2],
     pub training_cv_rms_px: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalMap>,
+}
+/// Smooth Gaussian residuals around measured gaze positions, on top of an
+/// affine baseline. Coordinates are normalized per screen axis, not pixels.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LocalMap {
+    pub centers: Vec<XY>,
+    pub weights: [Vec<f64>; 2],
+    pub bandwidth: f64,
+    pub ridge: f64,
+}
+fn kernel(a: XY, b: XY, bandwidth: f64) -> f64 {
+    (-((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)) / (2.0 * bandwidth * bandwidth)).exp()
 }
 fn features(p: XY) -> [f64; 6] {
     let x = p[0].clamp(0.0, 1.0) - 0.5;
@@ -164,12 +178,39 @@ impl Model {
                     .zip(basis)
                     .map(|(c, b)| c * b)
                     .sum::<f64>()
+                + self.local.as_ref().map_or(0.0, |local| {
+                    let bounded = p.map(|v| v.clamp(0.0, 1.0));
+                    local
+                        .centers
+                        .iter()
+                        .zip(&local.weights[axis])
+                        .map(|(center, weight)| weight * kernel(bounded, *center, local.bandwidth))
+                        .sum::<f64>()
+                })
         })
     }
     fn stable(&self) -> bool {
-        for yi in 0..=10 {
-            for xi in 0..=10 {
-                let p = [xi as f64 / 10.0, yi as f64 / 10.0];
+        if let Some(local) = &self.local {
+            if !(0.08..=1.0).contains(&local.bandwidth)
+                || !(0.001..=10.0).contains(&local.ridge)
+                || local.centers.is_empty()
+                || local.centers.len() > 100
+                || local
+                    .centers
+                    .iter()
+                    .flatten()
+                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                || local
+                    .weights
+                    .iter()
+                    .any(|w| w.len() != local.centers.len() || w.iter().any(|v| !v.is_finite()))
+            {
+                return false;
+            }
+        }
+        for yi in 0..=20 {
+            for xi in 0..=20 {
+                let p = [xi as f64 / 20.0, yi as f64 / 20.0];
                 let q = self.apply(p);
                 if q.iter().any(|v| !v.is_finite()) || distance(p, q, [1.0, 1.0]) > 0.25 {
                     return false;
@@ -251,6 +292,7 @@ fn fit(captures: &[&Capture], terms: usize) -> Option<Model> {
         kind: if terms == 3 { "Affine" } else { "Quadratic" }.into(),
         coefficients,
         training_cv_rms_px: 0.0,
+        local: None,
     };
     model.stable().then_some(model)
 }
@@ -275,17 +317,102 @@ fn candidate(captures: &[Capture], terms: usize, size: XY) -> Option<Model> {
     model.training_cv_rms_px = (error / captures.len() as f64).sqrt();
     Some(model)
 }
-fn choose_model(captures: &[Capture], size: XY) -> Option<Model> {
+fn fit_local(captures: &[&Capture], bandwidth: f64, ridge: f64) -> Option<Model> {
+    let mut model = fit(captures, 3)?;
+    let centers: Vec<_> = captures
+        .iter()
+        .map(|c| c.mean.map(|v| v.clamp(0.0, 1.0)))
+        .collect();
+    let mut matrix: Vec<Vec<f64>> = centers
+        .iter()
+        .map(|a| centers.iter().map(|b| kernel(*a, *b, bandwidth)).collect())
+        .collect();
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[i] += ridge;
+    }
+    let residuals: Vec<_> = captures
+        .iter()
+        .map(|c| {
+            let base = model.apply(c.mean);
+            [c.target[0] - base[0], c.target[1] - base[1]]
+        })
+        .collect();
+    let weights = [
+        solve(matrix.clone(), residuals.iter().map(|r| r[0]).collect())?,
+        solve(matrix, residuals.iter().map(|r| r[1]).collect())?,
+    ];
+    model.kind = "Local".into();
+    model.local = Some(LocalMap {
+        centers,
+        weights,
+        bandwidth,
+        ridge,
+    });
+    model.stable().then_some(model)
+}
+fn local_candidate(captures: &[Capture], size: XY, bandwidth: f64, ridge: f64) -> Option<Model> {
+    let mut error = 0.0;
+    for held in 0..captures.len() {
+        let training: Vec<_> = captures
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != held)
+            .map(|(_, c)| c)
+            .collect();
+        // Refit BOTH the affine baseline and local field without the held target.
+        let model = fit_local(&training, bandwidth, ridge)?;
+        error += distance(
+            model.apply(captures[held].mean),
+            captures[held].target,
+            size,
+        )
+        .powi(2);
+    }
+    let mut model = fit_local(&captures.iter().collect::<Vec<_>>(), bandwidth, ridge)?;
+    model.training_cv_rms_px = (error / captures.len() as f64).sqrt();
+    Some(model)
+}
+pub fn choose_model(captures: &[Capture], size: XY) -> Option<Model> {
+    if captures.len() < 8 {
+        return None;
+    }
     let affine = candidate(captures, 3, size)?;
-    match candidate(captures, 6, size) {
+    let global = match candidate(captures, 6, size) {
         Some(q)
             if q.training_cv_rms_px < affine.training_cv_rms_px * 0.9
                 && affine.training_cv_rms_px - q.training_cv_rms_px > 1.0 =>
         {
-            Some(q)
+            q
         }
-        _ => Some(affine),
+        _ => affine,
+    };
+    let local = local_model(captures, size);
+    Some(match local {
+        // Ridge already controls local complexity. Choose the lower training
+        // prediction error, retaining the simpler map for numerical ties.
+        Some(m) if m.training_cv_rms_px < global.training_cv_rms_px - 0.001 => m,
+        _ => global,
+    })
+}
+pub fn local_model(captures: &[Capture], size: XY) -> Option<Model> {
+    if captures.len() < 8 {
+        return None;
     }
+    // Fixed search space; validation captures never influence model selection.
+    let mut local: Option<Model> = None;
+    for bandwidth in [0.12, 0.20, 0.30, 0.45] {
+        for ridge in [0.03, 0.15, 0.60] {
+            if let Some(m) = local_candidate(captures, size, bandwidth, ridge) {
+                if local
+                    .as_ref()
+                    .is_none_or(|best| m.training_cv_rms_px < best.training_cv_rms_px)
+                {
+                    local = Some(m);
+                }
+            }
+        }
+    }
+    local
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -393,8 +520,30 @@ pub struct Report {
     pub training: Vec<Capture>,
     pub validation: Vec<Capture>,
     pub saved_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refit_from_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_metrics: Option<Metrics>,
 }
 impl Report {
+    pub fn refit(&self) -> Result<Self, String> {
+        if self.validation.is_empty() {
+            return Err("No independent checks were saved.".into());
+        }
+        let model = choose_model(&self.training, self.display.size())
+            .ok_or("Saved points could not produce a stable map.")?;
+        let mut result = self.clone();
+        result.schema_version = 2;
+        result.metrics = evaluate(&model, &self.validation, self.display.size());
+        result.model = model;
+        result.refit_from_unix_ms = Some(self.saved_at_unix_ms);
+        result.previous_metrics = Some(self.metrics.clone());
+        result.saved_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        Ok(result)
+    }
     pub fn load_latest() -> Option<Self> {
         let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("recordings");
         std::fs::read_dir(directory)
@@ -403,7 +552,7 @@ impl Report {
             .filter(|e| e.file_name().to_string_lossy().starts_with("calibration-"))
             .filter_map(|e| serde_json::from_slice::<Self>(&std::fs::read(e.path()).ok()?).ok())
             .filter(|r| {
-                r.schema_version == 1
+                matches!(r.schema_version, 1 | 2)
                     && r.model
                         .coefficients
                         .iter()
@@ -551,7 +700,7 @@ impl Session {
                         let validation = self.captures[TRAIN_COUNT..].to_vec();
                         let metrics = evaluate(&model, &validation, self.display.size());
                         self.finished = Some(Report {
-                            schema_version: 1,
+                            schema_version: 2,
                             display: self.display.clone(),
                             model,
                             metrics,
@@ -561,6 +710,8 @@ impl Session {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis(),
+                            refit_from_unix_ms: None,
+                            previous_metrics: None,
                         });
                     }
                 }
@@ -572,6 +723,107 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn local_fixture() -> Vec<Capture> {
+        let mut session = Session::new(Display {
+            name: "test".into(),
+            rect: [0, 0, 3840, 2160],
+        });
+        for _ in 0..TRAIN_COUNT {
+            let raw = session.target();
+            let target = local_truth(raw);
+            session
+                .captures
+                .push(capture(target, [raw[0] - target[0], raw[1] - target[1]]));
+        }
+        session.captures
+    }
+    fn local_truth(raw: XY) -> XY {
+        let x = raw[0] * std::f64::consts::TAU;
+        let y = raw[1] * std::f64::consts::TAU;
+        [
+            raw[0] + 0.025 * x.sin() * y.cos(),
+            raw[1] + 0.02 * x.cos() * y.sin(),
+        ]
+    }
+    #[test]
+    fn local_field_generalizes_nonquadratic_error_and_roundtrips() {
+        let training = local_fixture();
+        let local = choose_model(&training, [3840., 2160.]).unwrap();
+        assert_eq!(local.kind, "Local");
+        let global = candidate(&training, 6, [3840., 2160.]).unwrap();
+        let mut local_error = 0.;
+        let mut global_error = 0.;
+        for y in [0.1, 0.35, 0.65, 0.9] {
+            for x in [0.1, 0.35, 0.65, 0.9] {
+                let p = [x, y];
+                local_error += distance(local.apply(p), local_truth(p), [3840., 2160.]);
+                global_error += distance(global.apply(p), local_truth(p), [3840., 2160.]);
+            }
+        }
+        assert!(
+            local_error < global_error * 0.8,
+            "local {local_error}, global {global_error}"
+        );
+        let serialized = serde_json::to_string(&local).unwrap();
+        let restored: Model = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.stable());
+        assert!(
+            distance(
+                local.apply([0.31, 0.72]),
+                restored.apply([0.31, 0.72]),
+                [3840., 2160.]
+            ) < 1e-8
+        );
+        let edge = local.apply([1., 0.5]);
+        let outside = local.apply([1.2, 0.5]);
+        assert!((outside[0] - edge[0] - 0.2).abs() < 1e-10);
+        assert!((outside[1] - edge[1]).abs() < 1e-10);
+        let mut broken = restored;
+        broken.local.as_mut().unwrap().weights[0].pop();
+        assert!(!broken.stable());
+    }
+    #[test]
+    fn saved_refit_never_trains_on_checks_and_preserves_original() {
+        let training = local_fixture();
+        let model = candidate(&training, 3, [3840., 2160.]).unwrap();
+        let validation = vec![capture([0.3, 0.3], [0.01, 0.01])];
+        let mut report = Report {
+            schema_version: 1,
+            display: Display {
+                name: "test".into(),
+                rect: [0, 0, 3840, 2160],
+            },
+            metrics: evaluate(&model, &validation, [3840., 2160.]),
+            model,
+            training,
+            validation,
+            saved_at_unix_ms: 123,
+            refit_from_unix_ms: None,
+            previous_metrics: None,
+        };
+        let original = serde_json::to_string(&report).unwrap();
+        let first = report.refit().unwrap();
+        assert_eq!(original, serde_json::to_string(&report).unwrap());
+        report.validation = vec![capture([0.8, 0.8], [-0.08, 0.04])];
+        let second = report.refit().unwrap();
+        assert_eq!(
+            serde_json::to_string(&first.model).unwrap(),
+            serde_json::to_string(&second.model).unwrap()
+        );
+        assert_eq!(first.schema_version, 2);
+        assert_eq!(first.refit_from_unix_ms, Some(123));
+        assert!(first.previous_metrics.is_some());
+        assert_ne!(first.metrics.raw_mean_px, second.metrics.raw_mean_px);
+    }
+    #[test]
+    fn old_polynomial_models_load_without_local_fields() {
+        let json =
+            r#"{"kind":"Affine","coefficients":[[0.02,0,0],[0,0,0]],"training_cv_rms_px":10}"#;
+        let model: Model = serde_json::from_str(json).unwrap();
+        assert!(model.local.is_none());
+        assert!(model.stable());
+        assert_eq!(model.apply([0.5, 0.5]), [0.52, 0.5]);
+    }
     #[test]
     fn layout_reaches_every_corner_and_checks_them_independently() {
         let mut s = Session::new(Display {
@@ -618,6 +870,7 @@ mod tests {
             kind: "Affine".into(),
             coefficients: [vec![-0.02, 0., 0.], vec![0.; 3]],
             training_cv_rms_px: 0.,
+            local: None,
         };
         let captures: Vec<_> = CHECK_TARGETS
             .iter()
@@ -638,6 +891,7 @@ mod tests {
             kind: "Affine".into(),
             coefficients: [vec![0.04, 0.02, 0.01], vec![-0.03, 0.01, -0.02]],
             training_cv_rms_px: 0.,
+            local: None,
         };
         let mut captures = Vec::new();
         for y in [-0.03, 0.3, 0.7, 1.03] {
@@ -671,6 +925,7 @@ mod tests {
             kind: "Affine".into(),
             coefficients: [vec![-0.03, 0., 0.], vec![0.; 3]],
             training_cv_rms_px: 0.,
+            local: None,
         };
         let metrics = evaluate(&model, &[capture([0.3, 0.3], [0.03, 0.])], [3840., 2160.]);
         let mut json = serde_json::to_value(metrics).unwrap();
@@ -841,6 +1096,7 @@ mod tests {
             kind: "Affine".into(),
             coefficients: [vec![0.02, 0.0, 0.0], vec![0.0; 3]],
             training_cv_rms_px: 0.0,
+            local: None,
         };
         assert_eq!(model.apply([1.2, 0.5]), [1.22, 0.5]);
         assert!(model.stable());

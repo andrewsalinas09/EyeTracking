@@ -104,17 +104,28 @@ samples, 65% valid samples, and 70% retained among valid samples. Excess scatter
 a retry. These thresholds are experimental, not a certified fixation detector.
 
 An affine residual map corrects offset, scale, and skew. A regularized quadratic
-map is selected only if leave-one-target-out training RMS improves by at least
-10% and more than 1 pixel, avoiding complexity for negligible numerical changes.
-Models with folding, extreme stretching, or excessive correction are rejected.
+map replaces it if leave-one-target-out training RMS improves by at least 10%
+and more than 1 pixel. A local map adds smooth Gaussian residuals to an affine
+baseline, so different regions can correct in different directions. Its width
+and regularization are chosen from a fixed grid using only leave-one-target-out
+training RMS; both the baseline and local field are refitted inside each fold.
+The local map is selected when its training prediction error beats the global
+map (ties within 0.001 pixel keep the global map). Each target has equal weight.
+Models with folding, extreme stretching, or excessive correction are rejected
+on a 21-by-21 grid. Corrections use bounded features outside the screen, while
+the gaze position itself remains unclamped.
 The map is frozen before collecting 12 new validation dots: four near the corners,
 four near edge midpoints, and four in the interior, all separate from training.
 
 Results show original and corrected mean-target error, the worst target, and RMS
 error across ALL valid validation samples (including centroid outliers), weighted
-equally by target. White rings are validation targets, orange rings their original
-means, and mint dots the corrected means. Grey clouds are retained fitting samples;
-red dots are rejected fitting samples.
+equally by target. The results page has side-by-side, screen-shaped before/after
+maps that remain fully visible in a normal window. White rings are check targets;
+dots and lines show measured means and their distance from the target. Each target
+is labeled with its error in full-display pixels. Mint means improved; red means
+worse. Off-screen means are drawn at the edge, but error values use their actual
+coordinates. A prominent status says whether the correction is applied or only
+being previewed.
 
 Correction turns on automatically only when validation mean-target error improves
 by over 10% and 2 pixels, all-valid-sample RMS improves, at least 9 of 12 targets
@@ -130,6 +141,24 @@ display geometry, and validation metrics in `recordings/calibration-*.json`, exc
 from Git. The correction is local to this app and only applies on the same display
 name/geometry. The latest valid saved report is restored on startup; redo calibration
 if posture or Tobii calibration changes. Tobii's calibration is never overwritten.
+
+**Refit saved points** reuses the saved fitting captures, compares the new model
+on the saved check captures, and saves a new report before applying it. The original
+recording is kept. No fresh gaze is collected, and the UI explicitly labels this
+as a replay of saved checks. Replayed results are retrospective evidence, not a
+new independent accuracy test. The same automatic-enable rules still apply.
+Reports record the source timestamp and previous metrics. Version 2 stores the
+local field and remains readable across restarts; version 1 recordings remain
+loadable. Older binaries skip version 2 rather than misapplying only its baseline.
+
+To compare recordings without modifying them or connecting to the tracker:
+
+```powershell
+cargo run --example calibration_replay -- recordings/calibration-<timestamp>.json
+```
+
+With no path arguments, the replay tool verifies loading the latest saved map
+through the same loader used at app startup.
 
 Method references:
 - https://www.itl.nist.gov/div898/handbook/eda/section3/eda35h.htm
