@@ -26,12 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "compressed_stream_bytes":scalar("SELECT coalesce(sum(length(data)),0) FROM capture_batches")?,
                 "uncompressed_stream_bytes":scalar("SELECT coalesce(sum(raw_bytes),0) FROM capture_batches")?,
                 "recorded_events":scalar("SELECT coalesce(sum(event_count),0) FROM capture_batches")?,
-                "left_button_down_events":clicks,"recorded_seconds":seconds,
+                "left_button_down_events":clicks,"session_event_span_seconds":seconds,
                 "capture_gap_reports":scalar("SELECT count(*) FROM capture_index WHERE kind='capture_gap'")?,
                 "accepted_training_samples":scalar("SELECT count(*) FROM click_samples")?,
-                "bytes_per_recorded_second":if seconds>0{Some(bytes as f64/seconds as f64)}else{None},
+                "bytes_per_span_second":if seconds>0{Some(bytes as f64/seconds as f64)}else{None},
                 "million_click_bytes_at_observed_activity":if clicks>0{Some(bytes as f64/clicks as f64*1e6)}else{None},
-                "estimate_note":"Total disk cost depends on elapsed recording time and device rates as well as clicks. Small sessions include fixed setup/calibration overhead. WAL temporary space is additional."
+                "estimate_note":"Current sessions save click windows only; older sessions may contain continuous capture. Session spans include unsaved idle time, not continuous recording duration. Mixed-policy history and startup overhead make per-click projections approximate. WAL temporary space is additional."
             }))?
         );
         return Ok(());

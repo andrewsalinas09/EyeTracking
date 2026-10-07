@@ -326,14 +326,21 @@ imported into the database; persistent learning begins with this version.
 
 ### Research archive (database schema 2)
 
-`recordings/learning.sqlite3` also keeps a continuous, losslessly compressed research
-archive while the app is running, independently of whether an attempt trains the
-live model. Pausing gaze control or freezing learning does not stop recording.
+`recordings/learning.sqlite3` keeps losslessly compressed **click windows**,
+independently of whether a click trains the live model. Every mouse-button press
+or release saves the preceding five seconds and following one second of available
+gaze/pose/input data. Overlapping windows are saved once. Mouse motion, gaze jumps,
+scrolling and merely looking around never trigger a save. Between clicks,
+measurements exist only in a bounded RAM ring and expire; exit discards the unused
+ring. Pausing gaze control/freezing learning does not prevent click capture.
+Small setup/settings/calibration/model-context records are saved separately so
+future clips can be interpreted. Existing continuous recordings are retained;
+session metadata distinguishes the new `click_windows_v1` policy.
 There is no automatic age-based deletion. A schema-1 database is backed up as
 `learning.v1-backup.sqlite3` before its additive migration; old rows retain their
 original limited information. Missing historical signals cannot be reconstructed.
 
-Recorded information:
+Recorded information within click windows (plus setup/model metadata):
 
 - Every delivered gaze point, including invalid samples and off-screen coordinates;
   head position/rotation with individual validity flags; left/right gaze origins;
@@ -386,6 +393,9 @@ Read `(session, seq)` to join an indexed summary to its full batch event. Dense
 `field` arrays are omitted from index summaries only, marked `field_in_batch`.
 Use timestamps to align independent streams, preserving their original validity.
 Concurrent producers can enqueue out of sequence; sort within sessions as needed.
+Each button event includes `capture_window` bounds and whether the RAM capacity
+limit shortened its lookback. Missing sequence numbers outside windows are normal,
+not recording failures. Actual queue/write failures still produce gap reports.
 
 ```powershell
 cargo run --example capture_export -- --stats
@@ -395,13 +405,15 @@ cargo run --example capture_export -- --session SESSION_ID --output work/session
 
 The exporter opens SQLite read-only, refuses to overwrite an existing output,
 and streams one batch at a time. Statistics include event/click counts, compression,
-recorded time and a million-click projection at the observed activity rate. A
-click count alone cannot determine disk use: continuous gaze/head streams accrue
-between clicks, and high-rate mice/trackpads add more events. Projections from short
-sessions have fixed-overhead and activity-rate uncertainty; WAL temporary space and
+session time span and a million-click projection at the observed activity rate.
+Session spans include unsaved idle time, not continuous recording duration. Click
+spacing affects overlapping windows; device rates, map updates and startup overhead
+also affect size. Mixed historical continuous/current click-window recordings
+should not be used to estimate current disk use per hour. WAL temporary space and
 legacy diagnostic journals/HTML are additional.
 
-An initial ET5 measurement (2026-10-06, 33 Hz, roughly seven minutes, some
+For historical comparison only, an initial **continuous-capture** ET5 measurement
+(2026-10-06, 33 Hz, roughly seven minutes, some
 trackpad/click activity) recorded 61,401 events without a reported gap. Compressed
 stream rates varied around 13–17 KB/s while tracking; invalid/static samples can
 compress smaller. At that rate the stream portion of one million clicks would
@@ -411,16 +423,19 @@ SQLite pages/indexes, input activity, accepted labels and map updates add space.
 Sixty-four existing dense map updates averaged about 26 KB compressed each;
 their legacy JSONL plus HTML copies averaged another 247 KB per update. Thus one
 million actual map updates could add roughly 273 GB for map histories alone.
-A click that does not change the map does not incur that full-map cost. Longer
-idle recording adds streams without adding clicks. The running app used roughly
-33 MiB working-set RAM in this short check; it does not load the lifetime archive.
+A click that does not change the map does not incur that full-map cost. These
+continuous-capture estimates no longer apply to idle time under click-window
+recording. The running app used roughly 33 MiB working-set RAM in that short check;
+it does not load the lifetime archive.
 
 Input producers never wait for disk. The research queue holds at most 8 MiB of
-encoded event data (plus serialization, compression and worker overhead); batches
+encoded event data, plus a separate RAM lookback ring capped at 8 MiB and a bounded
+save batch (plus serialization/compression overhead). Batches
 are submitted for saving every 250 ms, or sooner at 512 events/512 KiB. Disk latency
 can delay completion. Overflow or write failure increments
 a visible cumulative loss count and writes a `capture_gap` when storage recovers.
-Normal exit drains the queue. Abrupt termination can lose queued data; a missing
+Normal exit drains selected events and discards unused lookback data. Abrupt
+termination can lose queued data; a missing
 session end marks an unclean exit. Research history stays on disk; HTML history
 generation streams the journal instead of retaining every learned field in RAM.
 

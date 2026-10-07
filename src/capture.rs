@@ -1,10 +1,13 @@
 //! Versioned research archive, separate from eligibility and learned state.
 //! Bounded, nonblocking producers; compressed batches and explicit loss counters
 //! prevent high-rate devices or disk failures from silently corrupting a dataset.
+//! Keep idle measurements in a bounded RAM ring, not on disk. Only button events
+//! save a 5-second lookback plus 1-second tail; motion/scroll/jumps never trigger.
 use flate2::{write::ZlibEncoder, Compression};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     io::Write,
     path::Path,
     sync::{
@@ -15,6 +18,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const PRE_CLICK_US: u64 = 5_000_000;
+const POST_CLICK_US: u64 = 1_000_000;
 static ACTIVE: Mutex<Weak<Sink>> = Mutex::new(Weak::new());
 static START_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static INTERACTION: AtomicU64 = AtomicU64::new(1);
@@ -131,6 +136,95 @@ struct Event {
     interaction: Option<u64>,
     bytes: Vec<u8>,
 }
+/// The writer owns this ring. Expiration is intentional sampling, not data loss.
+/// Metadata/model state is saved separately so the next clip remains interpretable.
+#[derive(Default)]
+struct ClickWindow {
+    ring: VecDeque<Event>,
+    bytes: usize,
+    latest: u64,
+    window: Option<(u64, u64)>,
+    capacity_evicted_through: Option<u64>,
+}
+impl ClickWindow {
+    fn metadata(kind: &str) -> bool {
+        matches!(
+            kind,
+            "session_start"
+                | "session_end"
+                | "tracker_connection"
+                | "tracker_runtime"
+                | "tracker_device"
+                | "stream_availability"
+                | "input_environment"
+                | "input_device"
+                | "touchpad_descriptor"
+                | "preferences"
+                | "context"
+                | "learning_reset"
+                | "calibration_change"
+                | "calibration_session"
+        )
+    }
+    fn accept(&mut self, mut event: Event) -> Vec<Event> {
+        self.latest = self.latest.max(event.mono);
+        let cutoff = self.latest.saturating_sub(PRE_CLICK_US);
+        while self.ring.front().is_some_and(|e| e.mono < cutoff) {
+            self.bytes -= self.ring.pop_front().unwrap().bytes.len();
+        }
+        if Self::metadata(&event.kind) {
+            return vec![event];
+        }
+        if event.kind == "click" {
+            let start = event.mono.saturating_sub(PRE_CLICK_US);
+            let end = event.mono.saturating_add(POST_CLICK_US);
+            let mut value: Value = serde_json::from_slice(&event.bytes).unwrap();
+            value["data"]["capture_window"] = json!({
+                "start_mono_us":start,"end_mono_us":end,
+                "prebuffer_capacity_truncated":self.capacity_evicted_through.is_some_and(|t| t>=start),
+            });
+            event.bytes = serde_json::to_vec(&value).unwrap();
+            // Already saved events have left the ring, so overlapping clips cannot duplicate them.
+            let mut ready = Vec::new();
+            let mut future = VecDeque::new();
+            for buffered in self.ring.drain(..) {
+                if buffered.mono > end {
+                    future.push_back(buffered);
+                } else if buffered.mono >= start {
+                    ready.push(buffered);
+                }
+            }
+            self.ring = future;
+            self.bytes = self.ring.iter().map(|e| e.bytes.len()).sum();
+            self.window = Some(match self.window {
+                Some((old_start, old_end)) if start <= old_end => {
+                    (old_start.min(start), old_end.max(end))
+                }
+                _ => (start, end),
+            });
+            ready.push(event);
+            return ready;
+        }
+        if self
+            .window
+            .is_some_and(|(start, end)| event.mono >= start && event.mono <= end)
+        {
+            return vec![event];
+        }
+        if event.mono < cutoff {
+            return Vec::new();
+        }
+        self.bytes += event.bytes.len();
+        self.ring.push_back(event);
+        while self.bytes > BYTE_BUDGET {
+            let removed = self.ring.pop_front().unwrap();
+            self.bytes -= removed.bytes.len();
+            self.capacity_evicted_through =
+                Some(self.capacity_evicted_through.unwrap_or(0).max(removed.mono));
+        }
+        Vec::new()
+    }
+}
 struct Sink {
     tx: mpsc::SyncSender<Event>,
     start: Instant,
@@ -185,7 +279,7 @@ impl Sink {
             format!("Recording warning: {lost} events lost")
         } else {
             format!(
-                "SQLite: {} research events saved",
+                "Clicks only: {} research events saved",
                 self.saved.load(Ordering::Relaxed)
             )
         }
@@ -223,6 +317,7 @@ impl Archive {
             error: error.clone(),
         });
         let worker = thread::spawn(move || {
+            let mut window = ClickWindow::default();
             let mut batch = Vec::new();
             let mut bytes = 0;
             let mut last = Instant::now();
@@ -232,8 +327,11 @@ impl Archive {
                 let remaining = Duration::from_millis(250).saturating_sub(last.elapsed());
                 match rx.recv_timeout(remaining) {
                     Ok(event) => {
-                        bytes += event.bytes.len();
-                        batch.push(event);
+                        queued.fetch_sub(event.bytes.len(), Ordering::Relaxed);
+                        for event in window.accept(event) {
+                            bytes += event.bytes.len();
+                            batch.push(event);
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -257,7 +355,6 @@ impl Archive {
                             }
                         }
                     }
-                    queued.fetch_sub(bytes, Ordering::Relaxed);
                     batch.clear();
                     bytes = 0;
                     last = Instant::now();
@@ -288,7 +385,8 @@ impl Archive {
                 "git_revision":env!("EYETRACKING_GIT"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
                 "coordinates":"desktop physical pixels; raw gaze and position-guide coordinates normalized; head/origin mm; rotation radians",
                 "clock":"mono_us is session elapsed Instant at enqueue; wall_ms is Unix time; uptime_ms is Windows boot clock; SDK and input-message timestamps remain in payload",
-                "policy":"all available subscribed tracker samples and input events while app runs, including invalid/rejected/paused; no automatic retention deletion",
+                "policy":"click_windows_v1: only mouse button events save 5 seconds before and 1 second after; overlapping clips deduplicated; metadata/model changes saved separately; idle measurements discarded from RAM; no automatic history deletion",
+                "pre_click_us":PRE_CLICK_US,"post_click_us":POST_CLICK_US,"prebuffer_byte_budget":BYTE_BUDGET,
                 "eye_images":"not captured; this integration exposes estimated gaze/pose, not eye-camera frames",
                 "nonfinite":"numeric NaN/Infinity encoded as null; raw tracker float bits retained",
                 "queue_byte_budget":BYTE_BUDGET,"batch_target_delay_ms":250,
@@ -379,6 +477,103 @@ fn write_batch(
 mod tests {
     use super::*;
     use std::io::Read;
+    fn sample(seq: u64, mono: u64, kind: &str) -> Event {
+        Event {
+            seq,
+            mono,
+            wall: mono / 1000,
+            kind: kind.into(),
+            interaction: None,
+            bytes: serde_json::to_vec(&json!({"seq":seq,"mono_us":mono,"kind":kind,"data":{}}))
+                .unwrap(),
+        }
+    }
+    #[test]
+    fn only_clicks_trigger_windows_and_overlaps_are_not_duplicated() {
+        let mut w = ClickWindow::default();
+        assert!(w.accept(sample(1, 0, "gaze")).is_empty());
+        for (seq, t, kind) in [
+            (2, 4_999_999, "head_pose"),
+            (3, 5_000_000, "gaze"),
+            (4, 7_000_000, "jump"),
+            (5, 8_000_000, "wheel_input"),
+            (6, 9_000_000, "touchpad"),
+        ] {
+            assert!(w.accept(sample(seq, t, kind)).is_empty());
+        }
+        let first = w.accept(sample(7, 10_000_000, "click"));
+        assert_eq!(
+            first.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7]
+        );
+        assert_eq!(w.accept(sample(8, 11_000_000, "gaze")).len(), 1);
+        assert!(w.accept(sample(9, 11_000_001, "gaze")).is_empty());
+        let second = w.accept(sample(10, 12_000_000, "click"));
+        assert_eq!(
+            second.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![9, 10]
+        );
+        assert!(w.accept(sample(11, 14_000_000, "pointer")).is_empty());
+        // Setup/settings are retained without opening a capture window.
+        assert_eq!(w.accept(sample(12, 15_000_000, "preferences")).len(), 1);
+        assert!(w.accept(sample(13, 15_000_001, "gaze")).is_empty());
+    }
+    #[test]
+    fn prebuffer_is_bounded_and_reports_capacity_truncation_on_click() {
+        let mut w = ClickWindow::default();
+        let mut large = sample(1, 1_000_000, "raw_hid");
+        large.bytes = vec![0; BYTE_BUDGET + 1];
+        assert!(w.accept(large).is_empty());
+        assert_eq!(w.bytes, 0);
+        let ready = w.accept(sample(2, 2_000_000, "click"));
+        let value: Value = serde_json::from_slice(&ready[0].bytes).unwrap();
+        assert_eq!(
+            value["data"]["capture_window"]["prebuffer_capacity_truncated"],
+            true
+        );
+    }
+    #[test]
+    fn out_of_order_click_cannot_save_measurements_beyond_its_tail() {
+        let mut w = ClickWindow::default();
+        assert!(w.accept(sample(1, 12_000_000, "gaze")).is_empty());
+        let saved = w.accept(sample(2, 10_000_000, "click"));
+        assert_eq!(saved.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(w.ring.len(), 1);
+        let saved = w.accept(sample(3, 13_000_000, "click"));
+        assert_eq!(saved.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 3]);
+    }
+    #[test]
+    fn no_click_means_no_measurements_saved_even_on_exit() {
+        let path = path("idle");
+        {
+            let archive = Archive::start(&path, json!({})).unwrap();
+            let sink = archive.sink.as_ref().unwrap();
+            for kind in [
+                "gaze",
+                "head_pose",
+                "gaze_origin",
+                "pointer",
+                "raw_hid",
+                "touchpad",
+                "jump",
+                "attempt_started",
+                "attempt",
+                "wheel_input",
+                "controller_event",
+            ] {
+                sink.record(kind, None, json!({}));
+            }
+        }
+        let db = open_database(&path).unwrap();
+        let n: i64 = db
+            .query_row("SELECT sum(event_count) FROM capture_batches", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1); // session_end only: shutdown never persists the unused ring.
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
     fn path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "gaze-archive-{label}-{}-{}.sqlite3",
