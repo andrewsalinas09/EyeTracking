@@ -84,7 +84,18 @@ to settle and collects for 1.6 seconds. Press Space separately at each new dot.
 The gaze marker is hidden throughout calibration to avoid chasing feedback.
 Losing window focus pauses the capture; changing display geometry cancels the run.
 
-The first 15 dots fit a correction to the existing gaze output. Per-axis median
+The first 25 dots fit a correction to the existing gaze output. A 5 × 5 layout
+reaches 4% from each screen edge, with an additional band at 18%/82% so the
+upper corners and other edges have nearby support. Targets alternate across the
+screen rather than sweeping one row at a time. Instructions and capture buttons
+move to the opposite half of the screen so they cannot cover the active target.
+Live feedback shows whether gaze is currently detected. Capture in your normal
+sitting position: an area that loses eye tracking cannot be fixed by a coordinate
+map. Insufficient valid data keeps the same target for retry and never trains on
+the missing gaze. Cancel preserves the saved calibration if positioning cannot
+provide usable coverage; ordinary mouse/trackpad movement remains the fallback.
+
+Per-axis median
 absolute deviation (MAD) rejects samples with modified Z scores over 3.5, with a
 2-pixel MAD floor for quantization. The remaining samples are averaged. Rejection
 does not depend on closeness to the target. Captures need at least 25 retained
@@ -94,8 +105,10 @@ a retry. These thresholds are experimental, not a certified fixation detector.
 
 An affine residual map corrects offset, scale, and skew. A regularized quadratic
 map is selected only if leave-one-target-out training RMS improves by at least
-10%. Models with folding, extreme stretching, or excessive correction are rejected.
-The map is frozen before collecting 8 new validation dots, at different positions.
+10% and more than 1 pixel, avoiding complexity for negligible numerical changes.
+Models with folding, extreme stretching, or excessive correction are rejected.
+The map is frozen before collecting 12 new validation dots: four near the corners,
+four near edge midpoints, and four in the interior, all separate from training.
 
 Results show original and corrected mean-target error, the worst target, and RMS
 error across ALL valid validation samples (including centroid outliers), weighted
@@ -104,8 +117,11 @@ means, and mint dots the corrected means. Grey clouds are retained fitting sampl
 red dots are rejected fitting samples.
 
 Correction turns on automatically only when validation mean-target error improves
-by over 10% and 2 pixels, all-valid-sample RMS improves, at least 6 of 8 targets
-improve, and the worst target does not regress by more than 10%. A toggles the map
+by over 10% and 2 pixels, all-valid-sample RMS improves, at least 9 of 12 targets
+improve, and the worst target does not regress by more than 10%. Every checked
+corner must also avoid regression beyond 10% or 2 pixels (whichever is larger).
+Results list each corner's before/after error; older reports explicitly show
+that their corners were not checked. A toggles the map
 for comparison, including an experimental override when the checks do not pass.
 This is a short within-session check, not evidence of long-term calibration quality.
 

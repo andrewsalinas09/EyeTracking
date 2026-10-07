@@ -1,14 +1,30 @@
 //! App-local residual calibration. Models are selected using leave-one-target-out
 //! training error, then evaluated once on a separate, untouched validation block.
 //! Per-axis median/MAD rejection does NOT use proximity to the intended target.
+//! Fit and apply use the same bounded basis, including raw gaze beyond an edge.
 use crate::tobii::Sample;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SETTLE: Duration = Duration::from_millis(800);
 const COLLECT: Duration = Duration::from_millis(1600);
-pub const TRAIN_COUNT: usize = 15;
-pub const TOTAL: usize = 23;
+pub const TRAIN_COUNT: usize = 25;
+pub const CHECK_TARGETS: [XY; 12] = [
+    [0.07, 0.07],
+    [0.93, 0.93],
+    [0.93, 0.07],
+    [0.07, 0.93],
+    [0.50, 0.07],
+    [0.50, 0.93],
+    [0.07, 0.50],
+    [0.93, 0.50],
+    [0.30, 0.30],
+    [0.70, 0.70],
+    [0.70, 0.30],
+    [0.30, 0.70],
+];
+pub const CHECK_COUNT: usize = CHECK_TARGETS.len();
+pub const TOTAL: usize = TRAIN_COUNT + CHECK_COUNT;
 type XY = [f64; 2];
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -67,7 +83,10 @@ pub fn summarize(target: XY, observations: Vec<Observation>, size: XY) -> Result
         .map(|o| o.xy)
         .collect();
     if points.len() < 25 || points.len() as f64 / (observations.len().max(1) as f64) < 0.65 {
-        return Err("Too few valid samples. Face the tracker and press Space to retry.".into());
+        return Err(
+            "Tracking lost here. Adjust tracker position in your normal posture; Space retries."
+                .into(),
+        );
     }
     let center = [
         median(points.iter().map(|p| p[0]).collect()),
@@ -129,15 +148,15 @@ pub struct Model {
     pub training_cv_rms_px: f64,
 }
 fn features(p: XY) -> [f64; 6] {
-    let x = p[0] - 0.5;
-    let y = p[1] - 0.5;
+    let x = p[0].clamp(0.0, 1.0) - 0.5;
+    let y = p[1].clamp(0.0, 1.0) - 0.5;
     [1.0, x, y, x * x, x * y, y * y]
 }
 impl Model {
     pub fn apply(&self, p: XY) -> XY {
         // Keep the correction bounded outside the calibrated display; do not
         // clamp the gaze itself or make off-screen gaze appear on an edge.
-        let basis = features([p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)]);
+        let basis = features(p);
         std::array::from_fn(|axis| {
             p[axis]
                 + self.coefficients[axis]
@@ -259,13 +278,36 @@ fn candidate(captures: &[Capture], terms: usize, size: XY) -> Option<Model> {
 fn choose_model(captures: &[Capture], size: XY) -> Option<Model> {
     let affine = candidate(captures, 3, size)?;
     match candidate(captures, 6, size) {
-        Some(q) if q.training_cv_rms_px < affine.training_cv_rms_px * 0.9 => Some(q),
+        Some(q)
+            if q.training_cv_rms_px < affine.training_cv_rms_px * 0.9
+                && affine.training_cv_rms_px - q.training_cv_rms_px > 1.0 =>
+        {
+            Some(q)
+        }
         _ => Some(affine),
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct CornerError {
+    pub name: String,
+    pub raw_px: f64,
+    pub corrected_px: f64,
+}
+fn corner_name(p: XY) -> Option<&'static str> {
+    match (p[0], p[1]) {
+        (x, y) if x <= 0.15 && y <= 0.15 => Some("Upper left"),
+        (x, y) if x >= 0.85 && y <= 0.15 => Some("Upper right"),
+        (x, y) if x <= 0.15 && y >= 0.85 => Some("Lower left"),
+        (x, y) if x >= 0.85 && y >= 0.85 => Some("Lower right"),
+        _ => None,
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Metrics {
+    // Older reports remain readable, but must not imply that corners were checked.
+    #[serde(default)]
+    pub corner_errors: Vec<CornerError>,
     pub raw_mean_px: f64,
     pub corrected_mean_px: f64,
     pub raw_sample_rms_px: f64,
@@ -283,6 +325,7 @@ pub fn evaluate(model: &Model, captures: &[Capture], size: XY) -> Metrics {
     let mut worst_raw: f64 = 0.0;
     let mut worst_corrected: f64 = 0.0;
     let mut improved = 0;
+    let mut corner_errors = Vec::new();
     for cap in captures {
         let r = distance(cap.mean, cap.target, size);
         let c = distance(model.apply(cap.mean), cap.target, size);
@@ -291,6 +334,13 @@ pub fn evaluate(model: &Model, captures: &[Capture], size: XY) -> Metrics {
         worst_raw = worst_raw.max(r);
         worst_corrected = worst_corrected.max(c);
         improved += usize::from(c < r);
+        if let Some(name) = corner_name(cap.target) {
+            corner_errors.push(CornerError {
+                name: name.into(),
+                raw_px: r,
+                corrected_px: c,
+            });
+        }
         // All valid samples count for the generalization metric, including
         // samples rejected from centroid estimation. No cherry-picking the tail.
         let valid: Vec<_> = cap
@@ -318,8 +368,12 @@ pub fn evaluate(model: &Model, captures: &[Capture], size: XY) -> Metrics {
         && raw_mean - corrected_mean > 2.0
         && corrected_rms < raw_rms
         && worst_corrected <= worst_raw * 1.1
-        && improved * 4 >= captures.len() * 3;
+        && improved * 4 >= captures.len() * 3
+        && corner_errors
+            .iter()
+            .all(|c| c.corrected_px <= c.raw_px + (c.raw_px * 0.1).max(2.0));
     Metrics {
+        corner_errors,
         raw_mean_px: raw_mean,
         corrected_mean_px: corrected_mean,
         raw_sample_rms_px: raw_rms,
@@ -399,23 +453,19 @@ impl Session {
     }
     pub fn target(&self) -> XY {
         // Scramble grid traversal to reduce a simple time-vs-position drift trend.
-        const ORDER: [usize; 15] = [7, 0, 14, 4, 10, 2, 12, 5, 9, 1, 13, 3, 11, 6, 8];
+        // Full-display coverage plus a second band near each edge. Corner pairs
+        // occur early; later targets alternate across the display to limit drift.
+        const AXIS: [f64; 5] = [0.04, 0.18, 0.50, 0.82, 0.96];
+        const ORDER: [usize; TRAIN_COUNT] = [
+            12, 0, 24, 4, 20, 6, 18, 8, 16, 2, 22, 10, 14, 1, 23, 3, 21, 5, 19, 9, 15, 7, 17, 11,
+            13,
+        ];
         let i = self.captures.len();
         if i < TRAIN_COUNT {
             let j = ORDER[i];
-            [0.1 + 0.2 * (j % 5) as f64, 0.18 + 0.32 * (j / 5) as f64]
+            [AXIS[j % 5], AXIS[j / 5]]
         } else {
-            const CHECK: [XY; 8] = [
-                [0.2, 0.34],
-                [0.8, 0.66],
-                [0.6, 0.34],
-                [0.4, 0.66],
-                [0.8, 0.34],
-                [0.2, 0.66],
-                [0.4, 0.34],
-                [0.6, 0.66],
-            ];
-            CHECK[(i - TRAIN_COUNT).min(7)]
+            CHECK_TARGETS[(i - TRAIN_COUNT).min(CHECK_COUNT - 1)]
         }
     }
     pub fn start_capture(&mut self) {
@@ -494,7 +544,7 @@ impl Session {
                             "Could not fit a stable map. Press Esc, then C to try again.".into();
                         return;
                     }
-                    self.notice="Map fitted. Now check 8 NEW dots; these do not change the map. Space when ready.".into();
+                    self.notice=format!("Map fitted. Now check {CHECK_COUNT} NEW dots, including the corners. Space when ready.");
                 }
                 if self.captures.len() == TOTAL {
                     if let Some(model) = self.model.clone() {
@@ -522,6 +572,112 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layout_reaches_every_corner_and_checks_them_independently() {
+        let mut s = Session::new(Display {
+            name: "test".into(),
+            rect: [0, 0, 3840, 2160],
+        });
+        for _ in 0..TRAIN_COUNT {
+            s.captures.push(capture(s.target(), [0.; 2]));
+        }
+        for corner in [[0.04, 0.04], [0.96, 0.04], [0.04, 0.96], [0.96, 0.96]] {
+            assert!(s.captures.iter().any(|c| c.target == corner));
+        }
+        for right in [false, true] {
+            assert_eq!(
+                s.captures
+                    .iter()
+                    .filter(|c| c.target[1] <= 0.18
+                        && if right {
+                            c.target[0] >= 0.82
+                        } else {
+                            c.target[0] <= 0.18
+                        })
+                    .count(),
+                4
+            );
+        }
+        for (i, c) in s.captures.iter().enumerate() {
+            assert!(s.captures[..i].iter().all(|p| p.target != c.target));
+        }
+        assert_eq!(
+            CHECK_TARGETS
+                .iter()
+                .filter(|p| corner_name(**p).is_some())
+                .count(),
+            4
+        );
+        assert!(CHECK_TARGETS
+            .iter()
+            .all(|p| s.captures.iter().all(|c| c.target != *p)));
+    }
+    #[test]
+    fn a_good_average_cannot_hide_a_worse_upper_corner() {
+        let model = Model {
+            kind: "Affine".into(),
+            coefficients: [vec![-0.02, 0., 0.], vec![0.; 3]],
+            training_cv_rms_px: 0.,
+        };
+        let captures: Vec<_> = CHECK_TARGETS
+            .iter()
+            .enumerate()
+            .map(|(i, p)| capture(*p, [if i == 0 { -0.002 } else { 0.03 }, 0.]))
+            .collect();
+        let m = evaluate(&model, &captures, [3840., 2160.]);
+        assert!(m.corrected_mean_px < m.raw_mean_px * 0.9);
+        assert!(m.corrected_sample_rms_px < m.raw_sample_rms_px);
+        assert!(m.corrected_worst_target_px < m.raw_worst_target_px * 1.1);
+        assert_eq!(m.improved_targets, CHECK_COUNT - 1);
+        assert!(m.corner_errors[0].corrected_px > m.corner_errors[0].raw_px + 2.);
+        assert!(!m.recommend);
+    }
+    #[test]
+    fn fitting_uses_the_same_basis_as_application_for_offscreen_raw_gaze() {
+        let truth = Model {
+            kind: "Affine".into(),
+            coefficients: [vec![0.04, 0.02, 0.01], vec![-0.03, 0.01, -0.02]],
+            training_cv_rms_px: 0.,
+        };
+        let mut captures = Vec::new();
+        for y in [-0.03, 0.3, 0.7, 1.03] {
+            for x in [-0.03, 0.3, 0.7, 1.03] {
+                let target = truth.apply([x, y]);
+                captures.push(capture(target, [x - target[0], y - target[1]]));
+            }
+        }
+        let fitted = fit(&captures.iter().collect::<Vec<_>>(), 3).unwrap();
+        for c in captures {
+            assert!(distance(fitted.apply(c.mean), c.target, [3840., 2160.]) < 1.);
+        }
+    }
+    #[test]
+    fn missing_gaze_cannot_advance_a_calibration_target() {
+        let mut s = Session::new(Display {
+            name: "test".into(),
+            rect: [0, 0, 3840, 2160],
+        });
+        let target = s.target();
+        s.start_capture();
+        s.tick(&[], s.started.unwrap() + SETTLE + COLLECT);
+        assert!(s.captures.is_empty());
+        assert_eq!(s.target(), target);
+        assert!(s.notice.contains("Tracking lost"));
+        assert!(!s.capturing());
+    }
+    #[test]
+    fn older_reports_do_not_claim_corner_measurements() {
+        let model = Model {
+            kind: "Affine".into(),
+            coefficients: [vec![-0.03, 0., 0.], vec![0.; 3]],
+            training_cv_rms_px: 0.,
+        };
+        let metrics = evaluate(&model, &[capture([0.3, 0.3], [0.03, 0.])], [3840., 2160.]);
+        let mut json = serde_json::to_value(metrics).unwrap();
+        json.as_object_mut().unwrap().remove("corner_errors");
+        let loaded: Metrics = serde_json::from_value(json).unwrap();
+        assert!(loaded.corner_errors.is_empty());
+    }
     #[test]
     fn complete_session_keeps_validation_separate_and_freezes_the_fit() {
         let mut session = Session::new(Display {
@@ -552,8 +708,9 @@ mod tests {
         }
         let report = session.finished.unwrap();
         assert_eq!(report.model.coefficients, fitted.unwrap());
-        assert_eq!(report.training.len(), 15);
-        assert_eq!(report.validation.len(), 8);
+        assert_eq!(report.training.len(), TRAIN_COUNT);
+        assert_eq!(report.validation.len(), CHECK_COUNT);
+        assert_eq!(report.metrics.corner_errors.len(), 4);
         assert!(report.metrics.recommend);
         assert!(report
             .validation

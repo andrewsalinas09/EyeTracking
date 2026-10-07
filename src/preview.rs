@@ -1,6 +1,6 @@
 //! DPI-aware screen mapping: normalized gaze belongs to a whole physical monitor,
 //! never to the client rectangle. Moving/resizing the preview must not shift gaze.
-use crate::calibration::{Display, Report, Session, TRAIN_COUNT};
+use crate::calibration::{Display, Report, Session, CHECK_COUNT, TRAIN_COUNT};
 use crate::tobii::{Sample, Worker};
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
@@ -59,6 +59,17 @@ fn map_point(xy: [f32; 2], monitor: RECT, origin: POINT) -> [f32; 2] {
 }
 fn is_live(sample: &Sample, now: Instant) -> bool {
     sample.valid && now.duration_since(sample.received) <= Duration::from_millis(200)
+}
+/// Keep all calibration instructions/buttons opposite the active target.
+/// Logical pixels, shared by painting and child-control placement.
+fn calibration_panel(w: f32, h: f32, upper_target: bool) -> [f32; 4] {
+    let width = 760_f32.min(w - 48.);
+    [
+        (w - width) / 2.,
+        if upper_target { h - 232. } else { 24. },
+        width,
+        208.,
+    ]
 }
 
 unsafe fn display(hwnd: HWND) -> Display {
@@ -497,44 +508,59 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
     if let Some(session) = app.session.as_ref() {
         let count = session.captures.len();
         let heading = if count < TRAIN_COUNT {
-            format!("Fit the map · dot {} / 15", count + 1)
+            format!("Fit the map · dot {} / {TRAIN_COUNT}", count + 1)
         } else {
-            format!("Check the map · dot {} / 8", count - TRAIN_COUNT + 1)
+            format!(
+                "Check the map · dot {} / {CHECK_COUNT}",
+                count - TRAIN_COUNT + 1
+            )
         };
-        label(back.dc, px(30.0), px(25.0), px(30.0), white, &heading);
+        let [x, y, width, height] = calibration_panel(
+            w as f32 / scale,
+            h as f32 / scale,
+            session.target()[1] < 0.5,
+        );
+        let panel = RECT {
+            left: px(x),
+            top: px(y),
+            right: px(x + width),
+            bottom: px(y + height),
+        };
+        let brush = CreateSolidBrush(rgb(18, 29, 40));
+        FillRect(back.dc, &panel, brush);
+        DeleteObject(brush);
+        label(back.dc, px(x + 20.), px(y + 16.), px(26.0), white, &heading);
         label(
             back.dc,
-            px(30.0),
-            px(68.0),
-            px(15.0),
+            px(x + 20.),
+            px(y + 54.),
+            px(14.0),
             dim,
-            "Look at the bright dot. Press Space or select Capture dot, then keep looking until it moves.",
+            "Look at the bright dot. Press Space to capture, then keep looking until it moves.",
         );
         label(
             back.dc,
-            px(30.0),
-            h - px(142.0),
-            px(17.0),
+            px(x + 20.),
+            px(y + 85.),
+            px(14.0),
             teal,
             &session.notice,
         );
         label(
             back.dc,
-            px(30.0),
-            h - px(112.0),
-            px(14.0),
-            dim,
-            &format!(
-                "{hz:.1} Hz · gaze marker hidden during capture · 0.8 s settle + 1.6 s sampling"
-            ),
-        );
-        label(
-            back.dc,
-            px(30.0),
-            h - px(39.0),
-            px(14.0),
-            dim,
-            "Space captures a dot without moving the pointer. Esc returns to Overview.",
+            px(x + 20.),
+            px(y + 114.),
+            px(13.0),
+            if live.is_some() {
+                teal
+            } else {
+                rgb(248, 181, 99)
+            },
+            if live.is_some() {
+                "Gaze detected · Capture from your normal sitting position · Esc cancels"
+            } else {
+                "Gaze unavailable here · Keep your normal posture; adjust tracker position before retrying"
+            },
         );
     } else if report_visible {
         let report = app.report.as_ref().unwrap();
@@ -554,8 +580,11 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
             px(20.0),
             teal,
             &format!(
-                "Mean target error: {:.1} → {:.1} px     ·     {} / 8 dots improved",
-                m.raw_mean_px, m.corrected_mean_px, m.improved_targets
+                "Mean target error: {:.1} → {:.1} px     ·     {} / {} dots improved",
+                m.raw_mean_px,
+                m.corrected_mean_px,
+                m.improved_targets,
+                report.validation.len()
             ),
         );
         label(
@@ -572,6 +601,29 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 m.corrected_worst_target_px
             ),
         );
+        if m.corner_errors.is_empty() {
+            label(back.dc,px(30.),h-px(213.),px(14.),rgb(248,181,99),"Corners were not checked in this older calibration. Recalibrate for full-screen coverage.");
+        } else {
+            for (row, names) in [["Upper left", "Upper right"], ["Lower left", "Lower right"]]
+                .iter()
+                .enumerate()
+            {
+                let text = names
+                    .iter()
+                    .filter_map(|name| m.corner_errors.iter().find(|c| c.name == *name))
+                    .map(|c| format!("{}: {:.1} → {:.1} px", c.name, c.raw_px, c.corrected_px))
+                    .collect::<Vec<_>>()
+                    .join("     ·     ");
+                label(
+                    back.dc,
+                    px(30.),
+                    h - px(238. - row as f32 * 25.),
+                    px(14.),
+                    white,
+                    &text,
+                );
+            }
+        }
         label(back.dc,px(30.0),h-px(184.0),px(14.0),white,"White: target    Orange: original    Mint: corrected    Grey: fitting samples    Red: outliers");
         label(
             back.dc,
@@ -805,7 +857,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_TIMER => {
             let (repaint, refresh, layout) = APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
-                    let session = app.session.is_some();
+                    let session = app.session.as_ref().map(|s| s.captures.len());
                     update_calibration(hwnd, app);
                     let refresh = app.last_ui.elapsed() >= Duration::from_millis(250);
                     if refresh {
@@ -849,7 +901,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     (
                         !app.overview || refresh,
                         refresh,
-                        session != app.session.is_some(),
+                        session != app.session.as_ref().map(|s| s.captures.len()),
                     )
                 } else {
                     (false, false, false)
@@ -1134,6 +1186,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calibration_chrome_stays_clear_of_edge_and_interior_targets() {
+        for (w, h) in [(960., 720.), (1920., 1080.), (3840., 2160.)] {
+            for y in [0.04, 0.07, 0.18, 0.3, 0.5, 0.7, 0.82, 0.93, 0.96] {
+                let [_, top, _, height] = calibration_panel(w, h, y < 0.5);
+                assert!(y * h + 24. < top || y * h - 24. > top + height);
+                assert!(top >= 0. && top + height <= h);
+            }
+        }
+    }
     #[test]
     fn screen_mapping_handles_negative_monitor_origin_and_window_offset() {
         let monitor = RECT {

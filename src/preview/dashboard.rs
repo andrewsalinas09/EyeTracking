@@ -272,7 +272,7 @@ pub unsafe fn layout(hwnd: HWND) {
     let (overview, session) = APP.with(|a| {
         let a = a.borrow();
         let a = a.as_ref().unwrap();
-        (a.overview, a.session.is_some())
+        (a.overview, a.session.as_ref().map(|s| s.target()[1] < 0.5))
     });
     let scale = GetDpiForWindow(hwnd) as f32 / 96.0;
     let px = |n: f32| (n * scale).round() as i32;
@@ -304,10 +304,11 @@ pub unsafe fn layout(hwnd: HWND) {
             (HISTORY, 264. + half, 584., half - 48., 36.),
             (RESET, w - 172., 641., 132., 34.),
         ]);
-    } else if session {
+    } else if let Some(upper_target) = session {
+        let [x, y, _, _] = calibration_panel(w, h, upper_target);
         positions.extend([
-            (CAPTURE, w - 380., h - 90., 160., 42.),
-            (CANCEL, w - 208., h - 90., 184., 42.),
+            (CAPTURE, x + 20., y + 151., 160., 38.),
+            (CANCEL, x + 192., y + 151., 184., 38.),
         ]);
     } else {
         positions.extend([
