@@ -5,13 +5,15 @@
 //! residual field and interpolate it continuously at the base gaze position.
 //! Rejections may be detected during movement, but visual feedback is emitted
 //! only after a matching left-button release, never by movement or timeout alone.
+//! Corrections can cross window boundaries (including the taskbar). A click may
+//! also replace its own window; screen distance and drag checks validate intent.
 use crate::learning_store::{SavedLabel, SavedState, Store};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::VecDeque;
 
 type XY = [f64; 2];
-const MAX_CLICK_MS: u32 = 1500;
+const MAX_CLICK_MS: u32 = 3000;
 const HISTORY_MS: u32 = 300_000;
 const MAX_CORRECTION: f64 = 300.0;
 const MAX_OFFSET: f64 = 300.0;
@@ -35,6 +37,9 @@ struct Attempt {
     last: XY,
     path: f64,
     surface: usize,
+    last_surface: usize,
+    last_flags: u16,
+    last_time: u32,
     rect: [i32; 4],
     down: Option<(u32, XY)>,
     drag_path: f64,
@@ -313,7 +318,9 @@ impl Learner {
             log.record(json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
                 "base":p.base, "landing":p.landing, "target":p.down.map(|(_,target)|target),
                 "last":p.last, "path_px":p.path, "accepted":accepted, "updated":updated,
-                "status":reason, "grid":[COLS,ROWS], "field":updated.then_some(self.field.as_slice()), "evidence":p.evidence}));
+                "status":reason, "elapsed_ms":p.last_time.wrapping_sub(p.time),
+                "last_input_flags":p.last_flags, "landing_surface":p.surface,"last_surface":p.last_surface,
+                "grid":[COLS,ROWS], "field":updated.then_some(self.field.as_slice()), "evidence":p.evidence}));
         }
     }
     /// Bilinear interpolation gives a continuous correction, without snapping
@@ -379,11 +386,13 @@ impl Learner {
         }
     }
     pub fn expire(&mut self, now: u32) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| now.wrapping_sub(p.time) > MAX_CLICK_MS)
-        {
+        if self.pending.as_ref().is_some_and(|p| match p.down {
+            Some(_) => now.wrapping_sub(p.time) > MAX_CLICK_MS + 500,
+            None => now.wrapping_sub(p.time) > MAX_CLICK_MS,
+        }) {
+            if let Some(p) = self.pending.as_mut() {
+                p.last_time = now;
+            }
             self.cancel("Skipped: delayed click");
         }
     }
@@ -400,6 +409,9 @@ impl Learner {
             last: landing,
             path: 0.0,
             surface,
+            last_surface: surface,
+            last_flags: 0,
+            last_time: now,
             rect,
             down: None,
             drag_path: 0.0,
@@ -419,8 +431,26 @@ impl Learner {
         let Some(p) = self.pending.as_mut() else {
             return;
         };
-        if !self.enabled || flags & !3 != 0 || !interior(cursor, p.rect) || surface != p.surface {
-            self.cancel("Skipped: scroll, other button or window");
+        p.last_surface = surface;
+        p.last_flags = flags;
+        p.last_time = now;
+        let invalid = if !self.enabled {
+            Some("Skipped: learning paused")
+        } else if flags & (0x0400 | 0x0800) != 0 {
+            Some("Skipped: scrolling")
+        } else if flags & !3 != 0 {
+            Some("Skipped: other mouse button")
+        } else if !cursor
+            .iter()
+            .enumerate()
+            .all(|(i, x)| x.is_finite() && *x >= p.rect[i] as f64 && *x < p.rect[i + 2] as f64)
+        {
+            Some("Skipped: outside calibrated display")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            self.cancel(reason);
             return;
         }
         let travel = distance(cursor, p.last);
@@ -747,7 +777,7 @@ mod tests {
         assert!(distance(local_offset(&l), [-15.0, 10.0]) < 0.1);
     }
     #[test]
-    fn drag_long_move_delay_scroll_window_change_and_quick_click_are_rejected() {
+    fn drag_long_move_delay_scroll_outside_display_and_quick_click_are_rejected() {
         for kind in 0..6 {
             let mut l = Learner::default();
             l.begin(0, [1000.0; 2], [1000.0; 2], 1, RECT);
@@ -757,15 +787,49 @@ mod tests {
                     l.event(220, [1020.0; 2], 0, 1);
                 }
                 1 => l.event(100, [1300.0; 2], 0, 1),
-                2 => l.event(1600, [1000.0; 2], 1, 1),
+                2 => l.event(MAX_CLICK_MS + 1, [1000.0; 2], 1, 1),
                 3 => l.event(100, [1000.0; 2], 1024, 1),
-                4 => l.event(100, [1000.0; 2], 1, 2),
+                4 => l.event(100, [-1.0, 1000.0], 1, 2),
                 _ => l.event(10, [1000.0; 2], 1, 1),
             }
             l.event(250, [1010.0; 2], 2, 1);
             assert_eq!(l.accepted, 0, "case {kind}");
             assert_eq!(local_offset(&l), [0.0; 2]);
         }
+    }
+    #[test]
+    fn short_cross_window_corrections_and_click_opened_windows_are_eligible() {
+        let mut learner = Learner::default();
+        // A gaze landing just above the taskbar, followed by a correction onto
+        // the taskbar and a click which opens a different top-level window.
+        for n in 0..4 {
+            let t = n * 4000;
+            learner.begin(t, [430., 2066.], [430., 2066.], 1, RECT);
+            learner.event(t + 100, [483., 2087.], 0, 2);
+            assert!(learner.pending.is_some());
+            learner.event(t + 2700, [483., 2087.], 1, 2);
+            learner.event(t + 2850, [483., 2087.], 2, 3);
+            assert!(learner.take_feedback().unwrap().accepted);
+        }
+        assert_eq!(learner.accepted, 4);
+        assert!(learner.updates > 0);
+    }
+    #[test]
+    fn timely_press_can_release_after_deadline_and_screen_edge_is_a_valid_target() {
+        let mut learner = Learner::default();
+        learner.begin(0, [20., 100.], [20., 100.], 1, RECT);
+        learner.event(2900, [0., 100.], 1, 2);
+        learner.expire(3100);
+        learner.event(3200, [0., 100.], 2, 3);
+        assert_eq!(learner.accepted, 1);
+        learner.begin(4000, [20., 100.], [20., 100.], 1, RECT);
+        learner.event(6900, [0., 100.], 1, 2);
+        learner.event(7450, [0., 100.], 2, 3);
+        assert_eq!(learner.accepted, 1);
+        assert_eq!(
+            learner.take_feedback().unwrap().reason,
+            "Skipped: held click"
+        );
     }
     #[test]
     fn no_correction_clicks_counter_bias_and_reset_and_freeze_work() {
@@ -991,7 +1055,7 @@ mod tests {
             // Returning near the landing must not rehabilitate a long movement.
             learner.event(200, [1010.; 2], 0, 1);
             match end {
-                0 => learner.expire(1600),
+                0 => learner.expire(MAX_CLICK_MS + 1),
                 1 => learner.begin(300, [1000.; 2], [1000.; 2], 1, RECT),
                 2 => learner.event(300, [1010.; 2], 2, 1), // release without press
                 _ => {

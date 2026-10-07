@@ -254,10 +254,12 @@ The click is committed on release so dragging does not train the model. No gaze
 samples taken after the jump are used as labels. Successful clicks requiring no
 correction count too, so learning can settle instead of continually overshooting.
 
-Eligible clicks start 80–1500 ms after the jump and release within 500 ms; the
+Eligible clicks start 80–3000 ms after the jump and release within 500 ms; the
 correction is at most 300 physical pixels, with at most 600 pixels total travel.
-Scrolling, other buttons, keyboard modifiers, crossing top-level windows, edge
-clamping, dragging over 4 pixels, and delayed input invalidate the attempt. These
+Short corrections may cross window boundaries, including onto the taskbar, and
+the click may open or close a window. Targets at the screen edge are accepted.
+Scrolling, other buttons, keyboard modifiers, clamped gaze landings,
+dragging over 4 pixels, and delayed input invalidate the attempt. These
 are learning filters only; slide-to-land adds no travel threshold.
 
 The learner maintains a 65-column by 37-row field (2,405 nodes) of local XY corrections over the
@@ -303,7 +305,8 @@ Every resolved learning attempt is appended to `recordings/learning-*.jsonl`.
 Each record includes its timestamp, physical display rectangle, base gaze estimate
 (after fixed calibration, before online correction), actual pointer landing,
 click target when available, last cursor position, travel, eligibility, update
-outcome, and reason. Updated attempts and context/reset records include the dense field;
+outcome, and reason. Input flags, elapsed time and window handles help distinguish
+why attempts were rejected. Updated attempts and context/reset records include the dense field;
 context records also include grid dimensions, display and fixed calibration model.
 Resets begin new periods without deleting old diagnostic journals.
 Only attempts initiated by an eligible gaze jump are recorded, not the full gaze
