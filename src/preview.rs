@@ -20,6 +20,7 @@ struct App {
     overview: bool,
     tray: Option<tray::Tray>,
     preferences: crate::preferences::Preferences,
+    learning_overlay: Option<crate::learning_feedback::Overlay>,
     last_ui: Instant,
     mouse: Option<crate::mouse::Controller>,
     worker: Worker,
@@ -933,6 +934,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 if let Some(app) = a.borrow_mut().as_mut() {
                     let session = app.session.as_ref().map(|s| s.captures.len());
                     update_calibration(hwnd, app);
+                    if let Some(mouse) = &app.mouse {
+                        let event = mouse.take_learning_feedback();
+                        if let Some(overlay) = &mut app.learning_overlay {
+                            if !app.preferences.learning_feedback || app.session.is_some() {
+                                overlay.hide();
+                            } else {
+                                if let Some(event) = event {
+                                    overlay.show(event, GetDpiForWindow(hwnd) as f64 / 96.);
+                                }
+                                overlay.tick();
+                            }
+                        }
+                    }
                     let refresh = app.last_ui.elapsed() >= Duration::from_millis(250);
                     if refresh {
                         app.last_ui = Instant::now();
@@ -943,6 +957,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                                 dot: s.dot,
                                 scroll: s.scroll,
                                 learning: s.learning,
+                                learning_feedback: app.preferences.learning_feedback,
                                 mouse_rearm_ms: s.mouse_rearm_ms,
                                 trackpad_rearm_ms: s.trackpad_rearm_ms,
                             };
@@ -1155,6 +1170,7 @@ pub fn run() {
         let correction = report.as_ref().is_some_and(|r| r.metrics.recommend);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
+                learning_overlay: None,
                 control_font: null_mut(),
                 overview: true,
                 tray: None,
@@ -1196,6 +1212,14 @@ pub fn run() {
                 MB_ICONERROR,
             );
         } else {
+            APP.with(|a| {
+                if let Some(a) = a.borrow_mut().as_mut() {
+                    match crate::learning_feedback::Overlay::new() {
+                        Ok(overlay) => a.learning_overlay = Some(overlay),
+                        Err(error) => a.notice = error,
+                    }
+                }
+            });
             let dark: BOOL = 1;
             windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
                 hwnd,

@@ -22,6 +22,17 @@ Stream Engine major version 4; other major versions need an ABI review.
 
 - **Pause / Resume gaze control** controls mouse and trackpad assistance.
 - **Gaze dot**, **Gaze scroll**, and **Learning** have independent visible switches.
+  **Learning visuals** independently controls brief, click-through feedback near
+  the correction. Orange marks the original landing; white marks the click;
+  mint animates the actual change in predicted landing and reports its pixel size.
+  Accepted clicks without consensus say that no map change happened. Rejected
+  long corrections/drags/held or ambiguous clicks explain why they were skipped;
+  a white selection is shown only when a click-down position was captured.
+  The animation fades within 2.4 seconds (1.5 for rejections) and never moves the
+  real cursor or captures input. Turning visuals off hides an active animation
+  immediately and keeps learning running. The visual preference is saved.
+  **Preview animation** shows a clearly labeled simulation without training the
+  learner. The Overview also shows the latest learning status beside its counters.
   Freezing learning keeps the current map; **Reset learning** clears the session's
   learned corrections after confirmation, keeping saved journals and calibration.
 - **Jump timing** has separate mouse and trackpad fields. Mouse accepts 50–2000 ms

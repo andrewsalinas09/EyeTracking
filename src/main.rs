@@ -2,6 +2,7 @@
 mod calibration;
 mod gaze_dot;
 mod learning;
+mod learning_feedback;
 mod learning_log;
 mod mouse;
 mod pose;

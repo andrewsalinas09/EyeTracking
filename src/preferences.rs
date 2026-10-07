@@ -11,6 +11,7 @@ pub struct Preferences {
     pub dot: bool,
     pub scroll: bool,
     pub learning: bool,
+    pub learning_feedback: bool,
     pub mouse_rearm_ms: u32,
     pub trackpad_rearm_ms: u32,
 }
@@ -21,6 +22,7 @@ impl Default for Preferences {
             dot: true,
             scroll: true,
             learning: true,
+            learning_feedback: true,
             mouse_rearm_ms: DEFAULT_REARM_MS,
             trackpad_rearm_ms: 0,
         }
@@ -71,6 +73,7 @@ mod tests {
         let p: Preferences = serde_json::from_str(r#"{"dot":false}"#).unwrap();
         assert!(!p.dot);
         assert!(p.enabled && p.scroll && p.learning);
+        assert!(p.learning_feedback);
         assert_eq!(p.mouse_rearm_ms, DEFAULT_REARM_MS);
         assert_eq!(p.trackpad_rearm_ms, 0);
         assert_eq!(

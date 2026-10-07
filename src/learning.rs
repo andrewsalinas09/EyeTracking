@@ -42,6 +42,20 @@ struct Label {
     position: XY,
     offset: XY,
 }
+/// Read-only evidence for the optional animation. `after` is a prediction at
+/// the original gaze, never a command to move the real pointer to the click.
+#[derive(Clone, Debug)]
+pub struct Feedback {
+    pub landed: XY,
+    pub before: XY,
+    pub after: XY,
+    pub selection: Option<XY>,
+    pub rect: [i32; 4],
+    pub accepted: bool,
+    pub updated: bool,
+    pub reason: &'static str,
+    pub demo: bool,
+}
 pub struct Learner {
     pub enabled: bool,
     field: [Node; COLS * ROWS],
@@ -54,6 +68,7 @@ pub struct Learner {
     recorder: Option<crate::learning_log::Recorder>,
     recording_error: String,
     epoch: u64,
+    feedback: Option<Feedback>,
 }
 impl Default for Learner {
     fn default() -> Self {
@@ -69,6 +84,7 @@ impl Default for Learner {
             recorder: None,
             recording_error: String::new(),
             epoch: 0,
+            feedback: None,
         }
     }
 }
@@ -91,6 +107,34 @@ fn interior(p: XY, r: [i32; 4]) -> bool {
         && p[1] < r[3] as f64 - 4.0
 }
 impl Learner {
+    pub fn take_feedback(&mut self) -> Option<Feedback> {
+        self.feedback.take()
+    }
+    fn publish_feedback(
+        &mut self,
+        p: &Attempt,
+        before: XY,
+        accepted: bool,
+        updated: bool,
+        reason: &'static str,
+    ) {
+        let offset = self.offset_at(p.base, p.rect);
+        self.feedback = Some(Feedback {
+            landed: p.landing,
+            before,
+            after: if updated {
+                [p.base[0] + offset[0], p.base[1] + offset[1]]
+            } else {
+                before
+            },
+            selection: p.down.map(|(_, target)| target),
+            rect: p.rect,
+            accepted,
+            updated,
+            reason,
+            demo: false,
+        });
+    }
     pub fn record_jump(&self, source: &str, success: bool) {
         if let Some(log) = &self.recorder {
             log.record(json!({"kind":"jump", "source":source, "success":success}));
@@ -195,6 +239,15 @@ impl Learner {
             self.rejected += 1;
             self.status = reason;
             self.record_attempt(&p, false, false, reason);
+            // Do not flash on ordinary gaze jumps, scrolling, pauses or resets.
+            // A rejected click/long correction deserves an honest explanation.
+            if reason == "Skipped: long correction"
+                || reason == "Skipped: drag"
+                || reason == "Skipped: held click"
+                || reason == "Skipped: ambiguous click"
+            {
+                self.publish_feedback(&p, p.landing, false, false, reason);
+            }
         }
     }
     pub fn expire(&mut self, now: u32) {
@@ -276,8 +329,17 @@ impl Learner {
             let rect = p.rect;
             let attempt = self.pending.take().unwrap();
             let previous = self.updates;
+            let offset = self.offset_at(attempt.base, rect);
+            let before = [attempt.base[0] + offset[0], attempt.base[1] + offset[1]];
             self.observe(now, position, label, rect);
             self.record_attempt(&attempt, true, self.updates != previous, self.status);
+            self.publish_feedback(
+                &attempt,
+                before,
+                true,
+                self.updates != previous,
+                self.status,
+            );
         }
     }
     pub fn observe(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
@@ -671,5 +733,31 @@ mod tests {
             after < before * 0.25,
             "held-out squared errors: {before} -> {after}"
         );
+    }
+    #[test]
+    fn feedback_matches_actual_learning_and_consuming_it_does_not_change_the_map() {
+        let mut shown = Learner::default();
+        let mut hidden = Learner::default();
+        for n in 0..8 {
+            let old = local_offset(&shown);
+            click(&mut shown, n * 1000, [30., -20.]);
+            click(&mut hidden, n * 1000, [30., -20.]);
+            let event = shown.take_feedback().unwrap();
+            assert!(event.accepted && !event.demo);
+            assert_eq!(event.updated, n >= 4);
+            assert!(distance(event.before, [1000. + old[0], 1000. + old[1]]) < 1e-9);
+            let new = local_offset(&shown);
+            assert!(distance(event.after, [1000. + new[0], 1000. + new[1]]) < 1e-9);
+            assert_eq!(event.selection, Some([1030., 980.]));
+            assert!(shown.take_feedback().is_none());
+            assert_eq!(local_offset(&shown), local_offset(&hidden));
+            assert_eq!(shown.updates, hidden.updates);
+        }
+        shown.begin(9000, [1000.; 2], [1000.; 2], 1, RECT);
+        shown.event(9100, [1200.; 2], 0, 1);
+        let rejected = shown.take_feedback().unwrap();
+        assert!(!rejected.accepted && !rejected.updated);
+        assert!(rejected.selection.is_none());
+        assert_eq!(rejected.after, rejected.before);
     }
 }

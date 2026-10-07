@@ -28,6 +28,8 @@ const REARM_APPLY: u32 = 122;
 const TRACKPAD_LABEL: u32 = 123;
 const TRACKPAD_EDIT: u32 = 124;
 const REFIT: u32 = 125;
+const FEEDBACK: u32 = 126;
+const FEEDBACK_DEMO: u32 = 127;
 const ALL: &[u32] = &[
     HOME,
     PREVIEW,
@@ -54,6 +56,8 @@ const ALL: &[u32] = &[
     TRACKPAD_EDIT,
     REARM_APPLY,
     REFIT,
+    FEEDBACK,
+    FEEDBACK_DEMO,
 ];
 const BG: u32 = 0x211913;
 const CARD: u32 = 0x2e251d;
@@ -159,6 +163,22 @@ unsafe fn caption(hwnd: HWND, id: u32, text: &str, enabled: bool) {
     EnableWindow(button, enabled as i32);
 }
 pub unsafe fn refresh(hwnd: HWND) {
+    let visuals = APP.with(|a| {
+        a.borrow()
+            .as_ref()
+            .is_some_and(|a| a.preferences.learning_feedback)
+    });
+    caption(
+        hwnd,
+        FEEDBACK,
+        if visuals {
+            "Learning visuals: On"
+        } else {
+            "Learning visuals: Off"
+        },
+        true,
+    );
+    caption(hwnd, FEEDBACK_DEMO, "Preview animation", visuals);
     let data = APP.with(|a| {
         a.borrow().as_ref().map(|a| {
             (
@@ -289,6 +309,8 @@ pub unsafe fn layout(hwnd: HWND) {
             (HOME, 16., 160., 160., 42.),
             (PREVIEW, 16., 212., 160., 42.),
             (RESULTS, 16., 264., 160., 42.),
+            (FEEDBACK, 16., 316., 160., 42.),
+            (FEEDBACK_DEMO, 16., 368., 160., 36.),
             (HIDE, 16., h - 112., 160., 40.),
             (QUIT, 16., h - 60., 160., 40.),
             (POWER, w - 220., 150., 180., 44.),
@@ -324,6 +346,8 @@ pub unsafe fn layout(hwnd: HWND) {
             (TRAIL, 24., h - 48., 130., 34.),
             (TARGETS, 166., h - 48., 170., 34.),
             (REFIT, 348., h - 48., 170., 34.),
+            (FEEDBACK, 530., h - 48., 170., 34.),
+            (FEEDBACK_DEMO, 712., h - 48., 174., 34.),
         ]);
     }
     for &id in ALL {
@@ -473,6 +497,7 @@ pub unsafe fn paint(hwnd: HWND, app: &mut App) {
     write(30., 35., 25., BG, "◉");
     write(66., 37., 21., TEXT, "EyeTracking");
     write(24., 85., 12., MUTED, "A more natural desktop");
+    write(24., 416., 11., MUTED, "Visuals don’t affect learning.");
     write(24., h - 204., 13., TEXT, "Close the panel.");
     write(24., h - 183., 13., TEXT, "Keep the flow.");
     write(24., h - 151., 11., MUTED, "Reopen from the tray icon.");
@@ -603,6 +628,7 @@ pub unsafe fn paint(hwnd: HWND, app: &mut App) {
             status.accepted, status.updates
         ),
     );
+    write(260. + half, 572., 11., MUTED, &status.learning_status);
     write(
         224.,
         642.,
@@ -745,6 +771,49 @@ pub unsafe fn command(hwnd: HWND, id: u32) {
             });
         }
         HOME => home(hwnd),
+        FEEDBACK => APP.with(|a| {
+            if let Some(a) = a.borrow_mut().as_mut() {
+                a.preferences.learning_feedback = !a.preferences.learning_feedback;
+                if !a.preferences.learning_feedback {
+                    if let Some(overlay) = &mut a.learning_overlay {
+                        overlay.hide();
+                    }
+                }
+                a.notice = match a.preferences.save() {
+                    Ok(()) => "Learning visuals changed. Learning itself is unchanged.".into(),
+                    Err(error) => format!("Could not save visual preference: {error}"),
+                };
+            }
+        }),
+        FEEDBACK_DEMO => APP.with(|a| {
+            if let Some(a) = a.borrow_mut().as_mut() {
+                if !a.preferences.learning_feedback {
+                    return;
+                }
+                if let Some(overlay) = &mut a.learning_overlay {
+                    let rect = display(hwnd).rect;
+                    let center = [
+                        (rect[0] + rect[2]) as f64 / 2.,
+                        (rect[1] + rect[3]) as f64 / 2.,
+                    ];
+                    let before = [center[0] - 65., center[1]];
+                    overlay.show(
+                        crate::learning::Feedback {
+                            landed: before,
+                            before,
+                            after: [before[0] + 12., before[1] - 4.],
+                            selection: Some(center),
+                            rect,
+                            accepted: true,
+                            updated: true,
+                            reason: "Preview animation",
+                            demo: true,
+                        },
+                        GetDpiForWindow(hwnd) as f64 / 96.,
+                    );
+                }
+            }
+        }),
         HIDE => hide(hwnd),
         QUIT => {
             DestroyWindow(hwnd);

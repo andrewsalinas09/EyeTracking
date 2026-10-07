@@ -38,6 +38,7 @@ pub struct Snapshot {
     pub dot: bool,
     pub scroll: bool,
     pub learning: bool,
+    pub learning_status: String,
     pub display_ok: bool,
     pub display: String,
     pub jumps: u64,
@@ -277,6 +278,9 @@ impl Controller {
     }
     pub fn snapshot(&self) -> Snapshot {
         self.config.lock().unwrap().snapshot.clone()
+    }
+    pub fn take_learning_feedback(&self) -> Option<crate::learning::Feedback> {
+        self.config.lock().unwrap().learning.take_feedback()
     }
     pub fn set_rearm_delay(&self, ms: u32) {
         unsafe {
@@ -819,6 +823,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     dot: ctx.dot_visible,
                     scroll: ctx.scroll_enabled,
                     learning: cfg.learning.enabled,
+                    learning_status: cfg.learning.status.into(),
                     display_ok: ctx.display_ok,
                     display: cfg.display.name.clone(),
                     jumps: ctx.jumps,
