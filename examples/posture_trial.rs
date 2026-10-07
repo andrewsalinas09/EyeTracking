@@ -12,6 +12,8 @@ mod calibration;
 mod learning;
 #[path = "../src/learning_log.rs"]
 mod learning_log;
+#[path = "../src/learning_store.rs"]
+mod learning_store;
 #[path = "../src/pose.rs"]
 mod pose;
 #[path = "../src/posture_model.rs"]

@@ -4,6 +4,7 @@ mod gaze_dot;
 mod learning;
 mod learning_feedback;
 mod learning_log;
+mod learning_store;
 mod mouse;
 mod pose;
 mod preferences;

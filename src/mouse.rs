@@ -39,6 +39,7 @@ pub struct Snapshot {
     pub scroll: bool,
     pub learning: bool,
     pub learning_status: String,
+    pub learning_storage: String,
     pub display_ok: bool,
     pub display: String,
     pub jumps: u64,
@@ -300,10 +301,17 @@ impl Controller {
     }
     pub fn correction(&self, report: &Report, enabled: bool) {
         let mut cfg = self.config.lock().unwrap();
+        let cfg = &mut *cfg;
         cfg.model = enabled.then(|| report.model.clone());
-        cfg.learning.reset();
+        cfg.learning
+            .change_context(&cfg.display, cfg.model.as_ref());
+    }
+    pub fn reset_learning(&self) -> Result<(), String> {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.learning.reset_persistent()?;
         cfg.learning
             .record_context(&cfg.display, cfg.model.as_ref());
+        Ok(())
     }
     pub fn open_learning_map(&self) -> Result<(), String> {
         self.config.lock().unwrap().learning.open_map()
@@ -321,17 +329,15 @@ impl Controller {
     }
     pub fn calibration(&self, active: bool, report: Option<&Report>) {
         let mut cfg = self.config.lock().unwrap();
+        let cfg = &mut *cfg;
         cfg.calibrating = active;
         cfg.learning.cancel("Calibration changed");
-        if active || report.is_some() {
-            cfg.learning.reset();
-        }
         if let Some(r) = report {
             cfg.display = r.display.clone();
             cfg.model = r.metrics.recommend.then(|| r.model.clone());
         }
         cfg.learning
-            .record_context(&cfg.display, cfg.model.as_ref());
+            .change_context(&cfg.display, cfg.model.as_ref());
     }
 }
 impl Drop for Controller {
@@ -754,15 +760,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             InvalidateRect(hwnd, null(), 0);
             0
         }
-        WM_HOTKEY if w == 2 || w == 3 => {
-            let mut cfg = ctx.config.lock().unwrap();
-            if w == 2 {
-                cfg.learning.toggle();
-            } else {
-                cfg.learning.reset();
-                cfg.learning
-                    .record_context(&cfg.display, cfg.model.as_ref());
+        WM_HOTKEY if w == 3 => {
+            // Route the shortcut through the same confirmation as the button.
+            let panel = FindWindowW(wide("EyeTrackingGazePreview").as_ptr(), null());
+            if !panel.is_null() {
+                PostMessageW(panel, WM_COMMAND, 110, 0);
             }
+            0
+        }
+        WM_HOTKEY if w == 2 => {
+            let mut cfg = ctx.config.lock().unwrap();
+            cfg.learning.toggle();
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -824,6 +832,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     scroll: ctx.scroll_enabled,
                     learning: cfg.learning.enabled,
                     learning_status: cfg.learning.status.into(),
+                    learning_storage: cfg.learning.storage_status(),
                     display_ok: ctx.display_ok,
                     display: cfg.display.name.clone(),
                     jumps: ctx.jumps,

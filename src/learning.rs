@@ -1,10 +1,11 @@
-//! Session-local implicit calibration. Clicks are noisy labels, not ground truth.
+//! Persistent implicit calibration. Clicks are noisy labels, not ground truth.
 //! Store click minus the BASE gaze map, not minus the already corrected landing;
 //! otherwise applying each residual repeatedly would create a feedback drift.
 //! Spatial errors cannot be represented by one global offset: learn a local
 //! residual field and interpolate it continuously at the base gaze position.
 //! Rejections may be detected during movement, but visual feedback is emitted
 //! only after a matching left-button release, never by movement or timeout alone.
+use crate::learning_store::{SavedLabel, SavedState, Store};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -12,14 +13,13 @@ use std::collections::VecDeque;
 type XY = [f64; 2];
 const MAX_CLICK_MS: u32 = 1500;
 const HISTORY_MS: u32 = 300_000;
-const MAX_CORRECTION: f64 = 120.0;
-const MAX_OFFSET: f64 = 80.0;
-const CONSENSUS_RADIUS: f64 = 20.0;
-const MAX_STEP: f64 = 2.0;
-const COLS: usize = 7;
-const ROWS: usize = 5;
-const LOCAL_RADIUS: f64 = 0.30;
-const MAX_LABELS: usize = 256;
+const MAX_CORRECTION: f64 = 300.0;
+const MAX_OFFSET: f64 = 300.0;
+const CONSENSUS_RADIUS: f64 = 40.0;
+const MAX_STEP: f64 = 6.0;
+const COLS: usize = 65;
+const ROWS: usize = 37;
+const MAX_LABELS: usize = 1024;
 
 #[derive(Clone, Copy, Default, Serialize)]
 struct Node {
@@ -42,6 +42,7 @@ struct Attempt {
 }
 struct Label {
     time: u32,
+    timestamp_ms: u64,
     position: XY,
     offset: XY,
 }
@@ -72,6 +73,9 @@ pub struct Learner {
     recording_error: String,
     epoch: u64,
     feedback: Option<Feedback>,
+    store: Option<Store>,
+    context_key: Option<String>,
+    storage_error: String,
 }
 impl Default for Learner {
     fn default() -> Self {
@@ -88,6 +92,9 @@ impl Default for Learner {
             recording_error: String::new(),
             epoch: 0,
             feedback: None,
+            store: None,
+            context_key: None,
+            storage_error: String::new(),
         }
     }
 }
@@ -154,9 +161,129 @@ impl Learner {
         match result {
             Ok(recorder) => {
                 self.recorder = Some(recorder);
-                self.record_context(display, model);
             }
             Err(e) => self.recording_error = format!("Learning save unavailable: {e}"),
+        }
+        match Store::open(std::path::Path::new("recordings/learning.sqlite3")) {
+            Ok(store) => self.store = Some(store),
+            Err(e) => self.storage_error = e,
+        }
+        self.change_context(display, model);
+    }
+    pub fn storage_status(&self) -> String {
+        if !self.storage_error.is_empty() {
+            return format!("Learning database error: {}", self.storage_error);
+        }
+        self.store
+            .as_ref()
+            .map_or_else(|| "Learning is not saved".into(), Store::status)
+    }
+    pub fn change_context(
+        &mut self,
+        display: &crate::calibration::Display,
+        model: Option<&crate::calibration::Model>,
+    ) {
+        // Only the actual mapping matters, not a report's date or validation score.
+        let key = json!({"display":display,"mapping":model.map(|m|json!({"coefficients":m.coefficients,"local":m.local}))}).to_string();
+        if self.context_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.reset();
+        self.context_key = Some(key.clone());
+        if let Some(store) = &self.store {
+            match store.load(key) {
+                Ok(Some(state)) => {
+                    if let Err(e) = self.restore(state, display.rect) {
+                        self.storage_error = e;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self.storage_error = e,
+            }
+        }
+        self.record_context(display, model);
+    }
+    fn restore(&mut self, state: SavedState, rect: [i32; 4]) -> Result<(), String> {
+        if state.version != 1
+            || state.cols != COLS
+            || state.rows != ROWS
+            || state.offsets.len() != COLS * ROWS
+            || state.trained.len() != COLS * ROWS
+            || state
+                .offsets
+                .iter()
+                .any(|p| !p.iter().all(|x| x.is_finite()) || p[0].hypot(p[1]) > MAX_OFFSET + 1e-6)
+            || state.labels.iter().any(|s| {
+                !s.position
+                    .iter()
+                    .all(|x| x.is_finite() && (0.0..=1.0).contains(x))
+                    || !s.offset.iter().all(|x| x.is_finite())
+            })
+        {
+            return Err("Saved map is incompatible or invalid; it was not applied".into());
+        }
+        let field = std::array::from_fn(|i| Node {
+            offset: state.offsets[i],
+            trained: state.trained[i],
+        });
+        if !field_is_stable(&field, rect) {
+            return Err("Saved map failed smoothness validation".into());
+        }
+        self.field = field;
+        self.accepted = state.accepted;
+        self.updates = state.updates;
+        let wall = crate::learning_log::timestamp_ms();
+        let tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
+        self.labels = state
+            .labels
+            .into_iter()
+            .filter_map(|s| {
+                let age = wall.checked_sub(s.timestamp_ms)?;
+                (age <= HISTORY_MS as u64).then_some(Label {
+                    time: tick.wrapping_sub(age as u32),
+                    timestamp_ms: s.timestamp_ms,
+                    position: s.position,
+                    offset: s.offset,
+                })
+            })
+            .take(MAX_LABELS)
+            .collect();
+        self.status = "Restored saved learning";
+        Ok(())
+    }
+    pub fn reset_persistent(&mut self) -> Result<(), String> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| self.storage_status())?
+            .reset()?;
+        self.reset();
+        self.storage_error.clear();
+        self.status = "Saved learning cleared";
+        Ok(())
+    }
+    fn persist(&self) {
+        if let (Some(store), Some(key), Some(last)) =
+            (&self.store, &self.context_key, self.labels.back())
+        {
+            let saved = |s: &Label| SavedLabel {
+                timestamp_ms: s.timestamp_ms,
+                position: s.position,
+                offset: s.offset,
+            };
+            store.save(
+                key.clone(),
+                SavedState {
+                    version: 1,
+                    cols: COLS,
+                    rows: ROWS,
+                    offsets: self.field.iter().map(|n| n.offset).collect(),
+                    trained: self.field.iter().map(|n| n.trained).collect(),
+                    labels: self.labels.iter().map(saved).collect(),
+                    accepted: self.accepted,
+                    updates: self.updates,
+                },
+                saved(last),
+            );
         }
     }
     pub fn record_context(
@@ -166,7 +293,7 @@ impl Learner {
     ) {
         if let Some(log) = &self.recorder {
             log.record(json!({"kind":"context", "schema":1, "epoch":self.epoch,
-                "display":display, "base_model":model, "field":self.field.as_slice(),
+                "display":display, "base_model":model, "grid":[COLS,ROWS], "field":self.field.as_slice(),
                 "coordinates":"physical desktop pixels; base gaze is after fixed calibration"}));
         }
     }
@@ -186,7 +313,7 @@ impl Learner {
             log.record(json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
                 "base":p.base, "landing":p.landing, "target":p.down.map(|(_,target)|target),
                 "last":p.last, "path_px":p.path, "accepted":accepted, "updated":updated,
-                "status":reason, "field":self.field.as_slice(), "evidence":p.evidence}));
+                "status":reason, "grid":[COLS,ROWS], "field":updated.then_some(self.field.as_slice()), "evidence":p.evidence}));
         }
     }
     /// Bilinear interpolation gives a continuous correction, without snapping
@@ -224,13 +351,19 @@ impl Learner {
         let recorder = self.recorder.take();
         let error = std::mem::take(&mut self.recording_error);
         let epoch = self.epoch + 1;
+        let store = self.store.take();
+        let context_key = self.context_key.take();
+        let storage_error = std::mem::take(&mut self.storage_error);
         *self = Self::default();
+        self.store = store;
+        self.context_key = context_key;
+        self.storage_error = storage_error;
         self.enabled = enabled;
         self.recorder = recorder;
         self.recording_error = error;
         self.epoch = epoch;
         if let Some(log) = &self.recorder {
-            log.record(json!({"kind":"reset", "epoch":epoch, "field":self.field.as_slice()}));
+            log.record(json!({"kind":"reset", "epoch":epoch, "grid":[COLS,ROWS], "field":self.field.as_slice()}));
         }
     }
     pub fn toggle(&mut self) {
@@ -296,7 +429,7 @@ impl Learner {
         if p.down.is_some() {
             p.drag_path += travel;
         }
-        if p.path > 240.0 || distance(cursor, p.landing) > MAX_CORRECTION {
+        if p.path > 600.0 || distance(cursor, p.landing) > MAX_CORRECTION {
             p.rejection.get_or_insert("Skipped: long correction");
         }
         if p.drag_path > 4.0 {
@@ -345,10 +478,15 @@ impl Learner {
         }
     }
     pub fn observe(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
+        self.observe_inner(now, position, offset, rect);
+        self.persist();
+    }
+    fn observe_inner(&mut self, now: u32, position: XY, offset: XY, rect: [i32; 4]) {
         self.labels
             .retain(|s| now.wrapping_sub(s.time) <= HISTORY_MS);
         self.labels.push_back(Label {
             time: now,
+            timestamp_ms: crate::learning_log::timestamp_ms(),
             position,
             offset,
         });
@@ -356,8 +494,8 @@ impl Learner {
             self.labels.pop_front();
         }
         self.accepted += 1;
-        if self.labels.len() < 5 {
-            self.status = "Gathering 5 local clicks";
+        if self.labels.len() < 3 {
+            self.status = "Gathering 3 local clicks";
             return;
         }
         let before = self.field;
@@ -368,7 +506,7 @@ impl Learner {
                 (index % COLS) as f64 / (COLS - 1) as f64,
                 (index / COLS) as f64 / (ROWS - 1) as f64,
             ];
-            let influence = spatial_weight(position, center);
+            let influence = spatial_weight(position, center, offset, rect);
             if influence == 0.0 {
                 continue;
             }
@@ -378,17 +516,17 @@ impl Learner {
                 .labels
                 .iter()
                 .rev()
-                .filter(|s| spatial_weight(s.position, center) > 0.0)
+                .filter(|s| spatial_weight(s.position, center, s.offset, rect) > 0.0)
                 .take(9)
                 .map(|s| {
                     (
                         s,
-                        spatial_weight(s.position, center)
+                        spatial_weight(s.position, center, s.offset, rect)
                             * 2_f64.powf(-(now.wrapping_sub(s.time) as f64) / 60_000.0),
                     )
                 })
                 .collect();
-            if nearby.len() < 5 {
+            if nearby.len() < 3 {
                 continue;
             }
             let median = weighted_median(&nearby);
@@ -397,7 +535,7 @@ impl Learner {
                 .filter(|(s, _)| distance(s.offset, median) <= CONSENSUS_RADIUS)
                 .collect();
             let total = inliers.iter().map(|(_, w)| w).sum::<f64>();
-            if inliers.len() < 5
+            if inliers.len() < 3
                 || total < nearby.iter().map(|(_, w)| w).sum::<f64>() * 0.6
                 || distance(offset, median) > CONSENSUS_RADIUS
             {
@@ -410,19 +548,28 @@ impl Learner {
                 MAX_OFFSET,
             );
             let step = bounded(
-                std::array::from_fn(|axis| (target[axis] - node.offset[axis]) * 0.15 * influence),
+                std::array::from_fn(|axis| (target[axis] - node.offset[axis]) * 0.25),
                 MAX_STEP,
             );
             node.offset = bounded(
-                std::array::from_fn(|axis| node.offset[axis] + step[axis]),
+                std::array::from_fn(|axis| node.offset[axis] + step[axis] * influence),
                 MAX_OFFSET,
             );
             node.trained = true;
             agreed = true;
         }
         // Bound the spatial gradient as well as the displacement. In screen
-        // pixels each partial derivative is <= 0.25, so this residual map cannot
+        // pixels each partial derivative is <= 0.45, so this residual map cannot
         // fold or reverse directions, even on a small or negative-origin screen.
+        for _ in 0..10 {
+            if field_is_stable(&proposed, rect) {
+                break;
+            }
+            for (node, old) in proposed.iter_mut().zip(before.iter()) {
+                node.offset =
+                    std::array::from_fn(|axis| (node.offset[axis] + old.offset[axis]) * 0.5);
+            }
+        }
         if !field_is_stable(&proposed, rect) {
             self.status = "Skipped: correction would distort map";
             return;
@@ -448,8 +595,12 @@ fn normalized(base: XY, rect: [i32; 4]) -> XY {
         (base[1] - rect[1] as f64) / (rect[3] - rect[1]).max(1) as f64,
     ]
 }
-fn spatial_weight(a: XY, b: XY) -> f64 {
-    let r = distance(a, b) / LOCAL_RADIUS;
+fn spatial_weight(a: XY, b: XY, offset: XY, rect: [i32; 4]) -> f64 {
+    // Larger errors require broader support to avoid a steep distortion around
+    // one clicked pixel. Small residuals remain local on the dense grid.
+    let size = (rect[2] - rect[0]).min(rect[3] - rect[1]).max(1) as f64;
+    let radius = (3.8 * offset[0].hypot(offset[1]) / size).clamp(0.18, 1.5);
+    let r = distance(a, b) / radius;
     if r >= 1.0 {
         0.0
     } else {
@@ -475,8 +626,8 @@ fn field_is_stable(field: &[Node; COLS * ROWS], rect: [i32; 4]) -> bool {
     let dx = (rect[2] - rect[0]) as f64 / (COLS - 1) as f64;
     let dy = (rect[3] - rect[1]) as f64 / (ROWS - 1) as f64;
     field.iter().enumerate().all(|(i, n)| {
-        (i % COLS == COLS - 1 || distance(n.offset, field[i + 1].offset) <= dx * 0.25)
-            && (i / COLS == ROWS - 1 || distance(n.offset, field[i + COLS].offset) <= dy * 0.25)
+        (i % COLS == COLS - 1 || distance(n.offset, field[i + 1].offset) <= dx * 0.45)
+            && (i / COLS == ROWS - 1 || distance(n.offset, field[i + COLS].offset) <= dy * 0.45)
     })
 }
 
@@ -486,6 +637,73 @@ mod tests {
     const RECT: [i32; 4] = [0, 0, 3840, 2160];
     fn local_offset(l: &Learner) -> XY {
         l.offset_at([1000.0, 1000.0], RECT)
+    }
+    #[test]
+    fn three_hundred_pixel_corrections_are_accepted_and_converge() {
+        let mut learner = Learner::default();
+        for n in 0..400 {
+            click(&mut learner, n * 500, [240., -180.]);
+        }
+        assert_eq!(learner.accepted, 400);
+        assert!(
+            distance(local_offset(&learner), [240., -180.]) < 2.0,
+            "offset {:?}",
+            local_offset(&learner)
+        );
+        assert!(field_is_stable(&learner.field, RECT));
+        let mut too_far = Learner::default();
+        click(&mut too_far, 0, [301., 0.]);
+        assert_eq!(too_far.accepted, 0);
+    }
+    #[test]
+    fn learned_field_survives_restart_and_context_switch_but_confirmed_reset_clears_all() {
+        let path = std::env::temp_dir().join(format!(
+            "gaze-restore-{}-{}.sqlite3",
+            std::process::id(),
+            crate::learning_log::timestamp_ms()
+        ));
+        let display = crate::calibration::Display {
+            name: "test".into(),
+            rect: RECT,
+        };
+        let other = crate::calibration::Display {
+            name: "other".into(),
+            rect: RECT,
+        };
+        let connect = || Learner {
+            store: Some(Store::open(&path).unwrap()),
+            ..Learner::default()
+        };
+        let expected;
+        {
+            let mut learner = connect();
+            learner.change_context(&display, None);
+            for n in 0..20 {
+                click(&mut learner, n * 1000, [100., -80.]);
+            }
+            expected = local_offset(&learner);
+            assert!(distance(expected, [0.; 2]) > 10.);
+            learner.change_context(&other, None);
+            assert_eq!(local_offset(&learner), [0.; 2]);
+            learner.change_context(&display, None);
+            assert_eq!(local_offset(&learner), expected);
+        }
+        {
+            let mut learner = connect();
+            learner.change_context(&display, None);
+            assert_eq!(local_offset(&learner), expected);
+            assert_eq!(learner.accepted, 20);
+            assert!(!learner.labels.is_empty());
+            learner.reset_persistent().unwrap();
+            assert_eq!(local_offset(&learner), [0.; 2]);
+        }
+        {
+            let mut learner = connect();
+            learner.change_context(&display, None);
+            assert_eq!(learner.accepted, 0);
+            assert_eq!(local_offset(&learner), [0.; 2]);
+        }
+        std::fs::remove_file(path).unwrap();
     }
     fn click(l: &mut Learner, now: u32, error: XY) {
         let base = [1000.0, 1000.0];
@@ -508,7 +726,7 @@ mod tests {
             let old = local_offset(&l);
             click(&mut l, n * 1000, [30.0, -20.0]);
             assert!(distance(old, local_offset(&l)) <= MAX_STEP + 1e-9);
-            if n < 4 {
+            if n < 2 {
                 assert_eq!(local_offset(&l), [0.0; 2]);
             }
         }
@@ -538,7 +756,7 @@ mod tests {
                     l.event(200, [1010.0; 2], 1, 1);
                     l.event(220, [1020.0; 2], 0, 1);
                 }
-                1 => l.event(100, [1200.0; 2], 0, 1),
+                1 => l.event(100, [1300.0; 2], 0, 1),
                 2 => l.event(1600, [1000.0; 2], 1, 1),
                 3 => l.event(100, [1000.0; 2], 1024, 1),
                 4 => l.event(100, [1000.0; 2], 1, 2),
@@ -712,11 +930,8 @@ mod tests {
         }
         let mut l = Learner::default();
         for n in 0..4200 {
-            let i = n as usize % (COLS * ROWS);
-            let p = [
-                (i % COLS) as f64 / (COLS - 1) as f64,
-                (i / COLS) as f64 / (ROWS - 1) as f64,
-            ];
+            let i = n as usize % 35;
+            let p = [(i % 7) as f64 / 6.0, (i / 7) as f64 / 4.0];
             l.observe(n * 50, p, error(p), RECT);
         }
         let mut before = 0.0;
@@ -746,7 +961,7 @@ mod tests {
             click(&mut hidden, n * 1000, [30., -20.]);
             let event = shown.take_feedback().unwrap();
             assert!(event.accepted && !event.demo);
-            assert_eq!(event.updated, n >= 4);
+            assert_eq!(event.updated, n >= 2);
             assert!(distance(event.before, [1000. + old[0], 1000. + old[1]]) < 1e-9);
             let new = local_offset(&shown);
             assert!(distance(event.after, [1000. + new[0], 1000. + new[1]]) < 1e-9);
@@ -756,14 +971,14 @@ mod tests {
             assert_eq!(shown.updates, hidden.updates);
         }
         shown.begin(9000, [1000.; 2], [1000.; 2], 1, RECT);
-        shown.event(9100, [1200.; 2], 0, 1);
+        shown.event(9100, [1300.; 2], 0, 1);
         assert!(shown.take_feedback().is_none());
-        shown.event(9200, [1200.; 2], 1, 1);
+        shown.event(9200, [1300.; 2], 1, 1);
         assert!(shown.take_feedback().is_none());
-        shown.event(9250, [1200.; 2], 2, 1);
+        shown.event(9250, [1300.; 2], 2, 1);
         let rejected = shown.take_feedback().unwrap();
         assert!(!rejected.accepted && !rejected.updated);
-        assert_eq!(rejected.selection, Some([1200.; 2]));
+        assert_eq!(rejected.selection, Some([1300.; 2]));
         assert_eq!(rejected.after, rejected.before);
     }
     #[test]

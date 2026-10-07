@@ -63,7 +63,7 @@ if the tray is unavailable, closing keeps the panel accessible instead of hiding
 Switches save in `recordings/preferences.json`. Development builds locate the
 repository automatically, including launches from Explorer or a shortcut. A
 standalone executable uses `%LOCALAPPDATA%\EyeTracking` for its data. Journals and
-calibration remain private local files; the live learned field is still session-local.
+calibration remain private local files. Learned corrections persist in SQLite across restarts and builds.
 
 In **Live preview**, the mint ring shows the latest valid gaze position, with a short fading trail.
 The small stationary dots are visual references, not a calibration procedure.
@@ -255,32 +255,39 @@ samples taken after the jump are used as labels. Successful clicks requiring no
 correction count too, so learning can settle instead of continually overshooting.
 
 Eligible clicks start 80–1500 ms after the jump and release within 500 ms; the
-correction is at most 120 physical pixels, with at most 240 pixels total travel.
+correction is at most 300 physical pixels, with at most 600 pixels total travel.
 Scrolling, other buttons, keyboard modifiers, crossing top-level windows, edge
 clamping, dragging over 4 pixels, and delayed input invalidate the attempt. These
 are learning filters only; slide-to-land adds no travel threshold.
 
-The learner maintains a 7-column by 5-row field of local XY corrections over the
+The learner maintains a 65-column by 37-row field (2,405 nodes) of local XY corrections over the
 base gaze position. Both horizontal and vertical errors can vary with both screen
 coordinates. Bilinear interpolation makes the correction continuous between grid
 points; areas without nearby evidence retain the base calibration.
 
-Up to 256 candidate labels are kept for 5 minutes. Each grid point considers its
-last 9 nearby labels, within a radius of 0.30 in normalized screen coordinates.
+Up to 1,024 candidate labels are kept for 5 minutes. Each grid point considers its
+last 9 nearby labels. The support radius starts at 0.18 in normalized screen coordinates
+and broadens with correction size to keep large corrections smooth.
 Weights taper smoothly to zero at that radius and decay with a 1-minute half-life.
-At least 5 labels must agree within 20 pixels of their weighted median and make up
+At least 3 labels must agree within 40 pixels of their weighted median and make up
 60% of the local weight. A disagreeing new click cannot update that grid point.
-Updates move 15% toward local consensus, scaled by the new click's proximity,
-limited to 2 pixels per click and 80 pixels total. Neighboring corrections also
+Updates move 25% toward local consensus, capped at 6 pixels per click before
+scaling by proximity, with a maximum total offset of 300 pixels. Neighboring corrections also
 have a spatial gradient limit to prevent folding the map. The dot, live preview,
 jumps and gaze scrolling all use the same position-dependent correction.
 
-The HUD shows accepted clicks, applied updates, trained grid points out of 35,
+The HUD shows accepted clicks, applied updates, trained grid points out of 2,405,
 and the most recent learning status. Ctrl+Alt+F9 freezes learning without removing
-the correction map; Ctrl+Alt+F10 resets
-it. Starting calibration or toggling its base correction resets adaptation too.
-Correction learns for the current run: restart starts fresh rather than applying
-a previous sitting position. Learning evidence is saved across runs (see below).
+the correction map; Ctrl+Alt+F10 opens the same confirmation as **Reset learning**.
+The map and eligible click evidence are saved in `recordings/learning.sqlite3`.
+Each monitor and fixed calibration mapping has its own profile. Restarting or rebuilding
+restores the matching map; switching calibration loads its corresponding profile.
+Starting and cancelling calibration preserves existing learning. Recent evidence expires
+after 5 minutes, but the learned map remains until reset or subsequent corrections change it.
+Reset asks **Are you sure?**, defaults to Cancel, and clears all profiles and database
+click samples only after confirmation. It keeps fixed calibration and old diagnostic journals.
+SQLite transactions save evidence and map together on a worker thread; ordered reset
+prevents queued saves from restoring erased data. The dashboard reports database errors.
 It does not rewrite the saved model or record browsing contents.
 Click targets are heuristics, so improved real-world
 accuracy still needs to be evaluated during use.
@@ -288,7 +295,7 @@ accuracy still needs to be evaluated during use.
 ### Learning history and map
 
 Learning is evaluated on each eligible left-button release, rather than at a
-fixed interval or on each gaze sample. Five consistent nearby labels are required
+fixed interval or on each gaze sample. Three consistent nearby labels are required
 before a region can change. The HUD counts eligible clicks separately from clicks
 that actually changed the correction field.
 
@@ -296,8 +303,9 @@ Every resolved learning attempt is appended to `recordings/learning-*.jsonl`.
 Each record includes its timestamp, physical display rectangle, base gaze estimate
 (after fixed calibration, before online correction), actual pointer landing,
 click target when available, last cursor position, travel, eligibility, update
-outcome, reason, and the resulting 7×5 field. Context records include the display
-and fixed calibration model. Resets begin new periods without deleting history.
+outcome, and reason. Updated attempts and context/reset records include the dense field;
+context records also include grid dimensions, display and fixed calibration model.
+Resets begin new periods without deleting old diagnostic journals.
 Only attempts initiated by an eligible gaze jump are recorded, not the full gaze
 stream or every desktop click. Saving and report generation run on a separate
 writer thread; the HUD reports save errors. Events are flushed after each record.
@@ -308,8 +316,9 @@ HTML map. It shows base gaze → landing → click, the learned field, outcome f
 separate calibration periods, magnified arrows, and clickable point/row details.
 It is a snapshot: press L again for an updated snapshot. A matching HTML snapshot
 is also saved at normal exit. Use **Open saved JSONL…** to inspect another run.
-Both files remain under `recordings/`; the online learner does not automatically
-reload old corrections. Data from runs before this feature cannot be recovered.
+Both files remain under `recordings/`. The viewer includes the map restored from SQLite
+at session start and supports older 7×5 journals. Legacy journals are not automatically
+imported into the database; persistent learning begins with this version.
 
 ### Gaze-directed scrolling
 

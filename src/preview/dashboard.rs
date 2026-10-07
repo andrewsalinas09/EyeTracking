@@ -326,7 +326,7 @@ pub unsafe fn layout(hwnd: HWND) {
         let half = (w - 264.) / 2.;
         positions.extend([
             (CALIBRATE, 240., 584., half - 48., 36.),
-            (HISTORY, 264. + half, 584., half - 48., 36.),
+            (HISTORY, 264. + half, 602., half - 48., 28.),
             (RESET, w - 172., 641., 132., 34.),
         ]);
     } else if let Some(upper_target) = session {
@@ -629,6 +629,7 @@ pub unsafe fn paint(hwnd: HWND, app: &mut App) {
         ),
     );
     write(260. + half, 572., 11., MUTED, &status.learning_status);
+    write(260. + half, 589., 10., MUTED, &status.learning_storage);
     write(
         224.,
         642.,
@@ -818,8 +819,21 @@ pub unsafe fn command(hwnd: HWND, id: u32) {
         QUIT => {
             DestroyWindow(hwnd);
         }
-        POWER | DOT | SCROLL | LEARN | RESET => {
-            if id==RESET && MessageBoxW(hwnd,wide("Clear this session’s learned corrections? Saved journals and calibration are kept.").as_ptr(),wide("Reset learning").as_ptr(),MB_OKCANCEL|MB_ICONQUESTION)!=IDOK {return;}
+        RESET => {
+            if MessageBoxW(hwnd,wide("Are you sure you want to erase all saved learned corrections and click samples?\n\nThis cannot be undone. Calibration and old diagnostic journals will be kept.").as_ptr(),wide("Reset all learning?").as_ptr(),MB_OKCANCEL|MB_ICONWARNING|MB_DEFBUTTON2)!=IDOK {return;}
+            APP.with(|a| {
+                if let Some(a) = a.borrow_mut().as_mut() {
+                    a.notice = match a.mouse.as_ref().map(|m| m.reset_learning()) {
+                        Some(Ok(())) => {
+                            "All saved learning cleared. New clicks will start a fresh map.".into()
+                        }
+                        Some(Err(e)) => format!("Could not reset learning: {e}"),
+                        None => "Controller unavailable.".into(),
+                    };
+                }
+            });
+        }
+        POWER | DOT | SCROLL | LEARN => {
             APP.with(|a| {
                 if let Some(m) = a.borrow().as_ref().and_then(|a| a.mouse.as_ref()) {
                     m.command(match id {

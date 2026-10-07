@@ -32,6 +32,10 @@ for(const [filter,count] of [['accepted',2],['updated',1],['rejected',1],['all',
 for(const scale of ['1','3','6']){get('scale').value=scale;get('scale').onchange();}
 get('field').checked=false;get('field').onchange();
 (async()=>{
+ const dense=[{...context(2),grid:[65,37],field:Array.from({length:2405},()=>({offset:[250,-100],trained:true}))}, {...attempt(true,false,[-1750,-1100],2),field:null}];
+ get('field').checked=true;
+ get('file').files=[{name:'dense.jsonl',async text(){return dense.map(r=>JSON.stringify(r)).join('\n');}}];
+ await get('file').onchange();assert.match(get('stats').textContent,/2405\/2405 grid points trained/);
  get('file').files=[{name:'saved.jsonl',async text(){return records.map(r=>JSON.stringify(r)).join('\n');}}];
  await get('file').onchange();assert.equal(get('detail').textContent,'Loaded saved.jsonl');
  get('file').files=[{name:'bad.jsonl',async text(){return '{broken';}}];
