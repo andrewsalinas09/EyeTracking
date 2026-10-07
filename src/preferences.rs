@@ -39,6 +39,7 @@ impl Preferences {
         p
     }
     pub fn save(self) -> Result<(), String> {
+        crate::capture::record("preferences", None, serde_json::json!(self));
         std::fs::create_dir_all("recordings").map_err(|e| e.to_string())?;
         let bytes = serde_json::to_vec_pretty(&self).map_err(|e| e.to_string())?;
         std::fs::write("recordings/preferences.tmp", bytes).map_err(|e| e.to_string())?;

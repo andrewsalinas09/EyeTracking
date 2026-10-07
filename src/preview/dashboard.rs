@@ -743,6 +743,7 @@ pub unsafe fn hide(hwnd: HWND) {
     }
 }
 pub unsafe fn command(hwnd: HWND, id: u32) {
+    crate::capture::record("ui_command", None, serde_json::json!({"control_id":id}));
     match id {
         1 => {
             // IsDialogMessage sends IDOK for Enter on an owner-drawn button.
@@ -820,7 +821,7 @@ pub unsafe fn command(hwnd: HWND, id: u32) {
             DestroyWindow(hwnd);
         }
         RESET => {
-            if MessageBoxW(hwnd,wide("Are you sure you want to erase all saved learned corrections and click samples?\n\nThis cannot be undone. Calibration and old diagnostic journals will be kept.").as_ptr(),wide("Reset all learning?").as_ptr(),MB_OKCANCEL|MB_ICONWARNING|MB_DEFBUTTON2)!=IDOK {return;}
+            if MessageBoxW(hwnd,wide("Are you sure you want to reset all learned corrections?\n\nThe active training samples and maps will be cleared. Your research archive, calibration and diagnostic journals will be kept.").as_ptr(),wide("Reset learning?").as_ptr(),MB_OKCANCEL|MB_ICONWARNING|MB_DEFBUTTON2)!=IDOK {return;}
             APP.with(|a| {
                 if let Some(a) = a.borrow_mut().as_mut() {
                     a.notice = match a.mouse.as_ref().map(|m| m.reset_learning()) {

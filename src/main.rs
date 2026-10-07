@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 mod calibration;
+mod capture;
 mod gaze_dot;
 mod learning;
 mod learning_feedback;
@@ -11,6 +12,7 @@ mod preferences;
 mod preview;
 mod scroll;
 mod tobii;
+mod tobii_capture;
 mod touchpad;
 
 fn main() {

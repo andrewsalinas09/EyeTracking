@@ -6,7 +6,6 @@ use std::{
     path::Path,
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -39,20 +38,7 @@ pub struct Store {
 struct Database(Connection);
 impl Database {
     fn open(path: &Path) -> Result<Self, String> {
-        let db = Connection::open(path).map_err(|e| e.to_string())?;
-        db.busy_timeout(Duration::from_secs(2))
-            .map_err(|e| e.to_string())?;
-        let version: i64 = db
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        if version > 1 {
-            return Err("Learning database was created by a newer app".into());
-        }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS profiles(context TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_ms INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS click_samples(id INTEGER PRIMARY KEY, context TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, x REAL NOT NULL, y REAL NOT NULL, dx REAL NOT NULL, dy REAL NOT NULL);
-            CREATE INDEX IF NOT EXISTS samples_context ON click_samples(context, timestamp_ms);
-            PRAGMA user_version=1;").map_err(|e|e.to_string())?;
+        let db = crate::capture::open_database(path)?;
         Ok(Self(db))
     }
     fn load(&self, key: &str) -> Result<Option<SavedState>, String> {

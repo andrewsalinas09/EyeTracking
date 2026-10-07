@@ -1,9 +1,11 @@
 //! Append-only learning evidence. Disk writes and report generation run off the
 //! input thread, so saving a click cannot stall a pointer jump or a scroll hook.
+//! Build HTML by streaming the journal: retaining every dense field in a Vec
+//! made RAM grow with the user's lifetime click history.
 use serde_json::{json, Value};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
@@ -81,7 +83,6 @@ impl Drop for Recorder {
 }
 fn run(file: File, path: PathBuf, rx: mpsc::Receiver<Message>, status: Arc<Mutex<String>>) {
     let mut writer = BufWriter::new(file);
-    let mut records = Vec::new();
     let mut saved = 0;
     let mut save_failed = false;
     let report = path.with_extension("html");
@@ -89,13 +90,13 @@ fn run(file: File, path: PathBuf, rx: mpsc::Receiver<Message>, status: Arc<Mutex
         match message {
             Message::Record(record) => {
                 // A partial line after an I/O failure must not be followed by
-                // another record on the same line. Retain later events in RAM.
+                // another record on the same line. Report failure explicitly;
+                // the independent SQLite archive still receives these events.
                 let result = if save_failed {
                     Err("writer stopped after an earlier save failure".into())
                 } else {
                     append(&mut writer, &record)
                 };
-                records.push(record);
                 match result {
                     Ok(()) => {
                         saved += 1;
@@ -111,7 +112,7 @@ fn run(file: File, path: PathBuf, rx: mpsc::Receiver<Message>, status: Arc<Mutex
                 }
             }
             Message::Open => {
-                let result = write_report(&report, &records).and_then(|()| {
+                let result = write_report(&report, &path).and_then(|()| {
                     std::process::Command::new("explorer.exe")
                         .arg(&report)
                         .spawn()
@@ -125,7 +126,7 @@ fn run(file: File, path: PathBuf, rx: mpsc::Receiver<Message>, status: Arc<Mutex
         }
     }
     // Keep a directly openable snapshot even when the user never presses L.
-    if let Err(e) = write_report(&report, &records) {
+    if let Err(e) = write_report(&report, &path) {
         *status.lock().unwrap() = format!("Learning map save failed: {e}");
     }
 }
@@ -136,15 +137,33 @@ fn append(writer: &mut impl Write, record: &Value) -> Result<(), String> {
         .and_then(|()| writer.flush())
         .map_err(|e| e.to_string())
 }
-fn write_report(path: &Path, records: &[Value]) -> Result<(), String> {
-    let data = serde_json::to_string(records)
-        .map_err(|e| e.to_string())?
-        .replace('<', "\\u003c");
-    fs::write(
-        path,
-        include_str!("learning_view.html").replace("/*RECORDS*/[]", &data),
-    )
-    .map_err(|e| e.to_string())
+fn write_report(path: &Path, journal: &Path) -> Result<(), String> {
+    let run = || -> Result<(), Box<dyn std::error::Error>> {
+        let (prefix, suffix) = include_str!("learning_view.html")
+            .split_once("/*RECORDS*/[]")
+            .ok_or("Missing report marker")?;
+        let mut out = BufWriter::new(File::create(path)?);
+        out.write_all(prefix.as_bytes())?;
+        out.write_all(b"[")?;
+        let mut first = true;
+        for line in BufReader::new(File::open(journal)?).lines() {
+            let line = line?;
+            // A truncated tail from an interrupted write is not valid evidence.
+            if serde_json::from_str::<Value>(&line).is_err() {
+                break;
+            }
+            if !first {
+                out.write_all(b",")?;
+            }
+            first = false;
+            out.write_all(line.replace('<', "\\u003c").as_bytes())?;
+        }
+        out.write_all(b"]")?;
+        out.write_all(suffix.as_bytes())?;
+        out.flush()?;
+        Ok(())
+    };
+    run().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

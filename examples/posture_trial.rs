@@ -8,6 +8,8 @@
 #![windows_subsystem = "windows"]
 #[path = "../src/calibration.rs"]
 mod calibration;
+#[path = "../src/capture.rs"]
+mod capture;
 #[path = "../src/learning.rs"]
 mod learning;
 #[path = "../src/learning_log.rs"]
@@ -20,6 +22,8 @@ mod pose;
 mod posture_model;
 #[path = "../src/tobii.rs"]
 mod tobii;
+#[path = "../src/tobii_capture.rs"]
+mod tobii_capture;
 use serde_json::{json, Value};
 use std::{
     cell::RefCell,

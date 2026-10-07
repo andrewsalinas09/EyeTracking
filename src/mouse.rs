@@ -9,7 +9,7 @@ use crate::{
     tobii::State,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
     sync::{mpsc, Arc, Mutex},
@@ -19,7 +19,10 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::{LibraryLoader::GetModuleHandleW, SystemInformation::GetTickCount},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemInformation::{GetTickCount, GetTickCount64},
+    },
     UI::{
         Input::{KeyboardAndMouse::*, *},
         WindowsAndMessaging::*,
@@ -135,6 +138,23 @@ impl Controller {
         report: Option<&Report>,
         enabled: bool,
     ) -> Result<Self, String> {
+        unsafe {
+            let mut speed = 0u32;
+            let mut accel = [0i32; 3];
+            let speed_ok =
+                SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &mut speed as *mut _ as *mut _, 0) != 0;
+            let accel_ok =
+                SystemParametersInfoW(SPI_GETMOUSE, 0, accel.as_mut_ptr() as *mut _, 0) != 0;
+            crate::capture::record(
+                "input_environment",
+                None,
+                serde_json::json!({
+                    "pointer_speed":speed_ok.then_some(speed),"pointer_acceleration":accel_ok.then_some(accel),
+                    "double_click_ms":GetDoubleClickTime(),"virtual_screen":[GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN)],
+                    "preferences":crate::preferences::Preferences::load(),"calibration_report":report,
+                }),
+            );
+        }
         let config = Arc::new(Mutex::new(Config {
             snapshot: Snapshot {
                 mouse_rearm_ms: crate::preferences::DEFAULT_REARM_MS,
@@ -192,6 +212,7 @@ impl Controller {
                 source: PointerSource::Touchpad,
                 last_click: None,
                 absolute: HashMap::new(),
+                captured_devices: HashSet::new(),
                 jumps: 0,
                 misses: 0,
                 motions: 0,
@@ -300,6 +321,11 @@ impl Controller {
         }
     }
     pub fn correction(&self, report: &Report, enabled: bool) {
+        crate::capture::record(
+            "calibration_change",
+            None,
+            serde_json::json!({"enabled":enabled,"report":report}),
+        );
         let mut cfg = self.config.lock().unwrap();
         let cfg = &mut *cfg;
         cfg.model = enabled.then(|| report.model.clone());
@@ -328,6 +354,11 @@ impl Controller {
         std::array::from_fn(|axis| (offset[axis] / size[axis]) as f32)
     }
     pub fn calibration(&self, active: bool, report: Option<&Report>) {
+        crate::capture::record(
+            "calibration_session",
+            None,
+            serde_json::json!({"active":active,"report":report}),
+        );
         let mut cfg = self.config.lock().unwrap();
         let cfg = &mut *cfg;
         cfg.calibrating = active;
@@ -365,6 +396,7 @@ struct Context {
     source: PointerSource,
     last_click: Option<u32>,
     absolute: HashMap<usize, (i32, i32)>,
+    captured_devices: HashSet<usize>,
     jumps: u64,
     misses: u64,
     motions: u64,
@@ -464,6 +496,9 @@ impl Context {
             return;
         }
         let mouse = input.data.mouse;
+        if self.captured_devices.insert(input.header.hDevice as usize) {
+            crate::capture::input_device(input.header.hDevice);
+        }
         let moved = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
             let next = (mouse.lLastX, mouse.lLastY);
             self.absolute.insert(input.header.hDevice as usize, next) != Some(next)
@@ -489,6 +524,31 @@ impl Context {
         let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT]
             .iter()
             .any(|k| GetAsyncKeyState(*k as i32) < 0);
+        let surface = has_cursor.then(|| surface_at(cursor));
+        let mut bounds: RECT = zeroed();
+        let bounds_ok =
+            flags != 0 && surface.is_some_and(|s| GetWindowRect(s as HWND, &mut bounds) != 0);
+        crate::capture::record(
+            if flags & 0x03ff != 0 {
+                "click"
+            } else if flags != 0 {
+                "wheel_input"
+            } else {
+                "pointer"
+            },
+            cfg.learning.interaction(),
+            serde_json::json!({
+                "input_message_tick_ms":now,"processing_tick_ms":GetTickCount(),"queue_delay_ms":GetTickCount().wrapping_sub(now),
+                "device_handle":input.header.hDevice as usize,"source":match source {PointerSource::Touchpad=>"touchpad",PointerSource::Mouse(_)=>"mouse"},
+                "movement_flags":mouse.usFlags,"button_flags":flags,"button_data":mouse.Anonymous.Anonymous.usButtonData,
+                "raw_buttons":mouse.ulRawButtons,"raw_delta_or_absolute":[mouse.lLastX,mouse.lLastY],"extra_information":mouse.ulExtraInformation,
+                "cursor":has_cursor.then_some([cursor.x,cursor.y]),"surface":surface,"surface_rect":bounds_ok.then_some([bounds.left,bounds.top,bounds.right,bounds.bottom]),
+            "foreground_surface":GetForegroundWindow() as usize,"target_dpi":if flags!=0{surface.map(|s|windows_sys::Win32::UI::HiDpi::GetDpiForWindow(s as HWND))}else{None},"modifier_keys":{"ctrl":GetAsyncKeyState(VK_CONTROL as i32)<0,"alt":GetAsyncKeyState(VK_MENU as i32)<0,"shift":GetAsyncKeyState(VK_SHIFT as i32)<0},
+                "assist_enabled":self.enabled,"learning_enabled":cfg.learning.enabled,"calibrating":cfg.calibrating,"display_ok":self.display_ok,
+                "rect":cfg.display.rect,"mouse_rearm_ms":self.mouse_rearm_ms,"trackpad_rearm_ms":self.trackpad_rearm_ms,
+                "relation":"interaction is most recent jump, not a guaranteed label; includes clicks outside learning window",
+            }),
+        );
         if !self.enabled
             || cfg.calibrating
             || !self.display_ok
@@ -572,9 +632,20 @@ impl Context {
             }
             .into();
             cfg.learning.record_jump(source, false);
+            crate::capture::record(
+                "jump",
+                cfg.learning.interaction(),
+                serde_json::json!({"source":source,"success":false,"reason":self.last_error,"input_message_tick_ms":now,"evidence":evidence,"rect":cfg.display.rect}),
+            );
             return;
         }
         let [x, y] = cfg.screen_point(point.unwrap());
+        let mut old: POINT = zeroed();
+        let old_ok = GetCursorPos(&mut old) != 0;
+        let base = cfg.base_point(point.unwrap());
+        let learned = cfg.learning.offset_at(base, cfg.display.rect);
+        let predicted = [base[0] + learned[0], base[1] + learned[1]];
+        let warp_start = GetTickCount64();
         if SetCursorPos(x, y) != 0 {
             self.jumps += 1;
             cfg.learning.record_jump(source, true);
@@ -583,7 +654,18 @@ impl Context {
             let base = cfg.base_point(point.unwrap());
             let rect = cfg.display.rect;
             let mut actual: POINT = zeroed();
-            if !modifiers && GetCursorPos(&mut actual) != 0 && actual.x == x && actual.y == y {
+            let actual_ok = GetCursorPos(&mut actual) != 0;
+            crate::capture::record(
+                "jump",
+                cfg.learning.interaction(),
+                serde_json::json!({
+                    "source":source,"success":true,"input_message_tick_ms":now,"warp_start_uptime_ms":warp_start,"warp_end_uptime_ms":GetTickCount64(),
+                    "cursor_before":old_ok.then_some([old.x,old.y]),"base_unclamped":base,"learned_offset":learned,"prediction_unclamped":predicted,
+                    "requested_landing":[x,y],"actual_landing":actual_ok.then_some([actual.x,actual.y]),"rect":rect,"evidence":evidence,
+                    "clamped":predicted[0]<rect[0] as f64 || predicted[1]<rect[1] as f64 || predicted[0]>(rect[2]-1) as f64 || predicted[1]>(rect[3]-1) as f64,
+                }),
+            );
+            if !modifiers && actual_ok && actual.x == x && actual.y == y {
                 cfg.learning
                     .begin(now, base, [x as f64, y as f64], surface_at(actual), rect);
                 if let Some(evidence) = evidence {
@@ -591,9 +673,15 @@ impl Context {
                 }
             }
         } else {
+            let error = windows_sys::Win32::Foundation::GetLastError();
             self.misses += 1;
-            cfg.learning.record_jump(source, false);
             self.last_error = "Windows rejected cursor movement".into();
+            cfg.learning.record_jump(source, false);
+            crate::capture::record(
+                "jump",
+                cfg.learning.interaction(),
+                serde_json::json!({"source":source,"success":false,"reason":self.last_error,"windows_error":error,"input_message_tick_ms":now,"base_unclamped":base,"prediction_unclamped":predicted,"requested_landing":[x,y],"evidence":evidence}),
+            );
         }
     }
     unsafe fn paint(&self, hwnd: HWND) {
@@ -689,6 +777,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         return DefWindowProcW(hwnd, msg, w, l);
     }
     let ctx = &mut *ptr;
+    if matches!(
+        msg,
+        WM_HOTKEY
+            | SET_REARM
+            | SET_TRACKPAD_REARM
+            | TOGGLE
+            | WM_INPUT_DEVICE_CHANGE
+            | crate::scroll::SCROLLED
+    ) {
+        let mut cursor: POINT = zeroed();
+        let cursor_ok = GetCursorPos(&mut cursor) != 0;
+        crate::capture::record(
+            "controller_event",
+            None,
+            serde_json::json!({"message":msg,"wparam":w,"lparam":l,"message_tick_ms":GetMessageTime() as u32,"cursor":cursor_ok.then_some([cursor.x,cursor.y])}),
+        );
+    }
     match msg {
         SET_TRACKPAD_REARM => {
             ctx.trackpad_rearm_ms = (w as u32).min(crate::preferences::MAX_REARM_MS);
@@ -717,6 +822,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         WM_INPUT_DEVICE_CHANGE if w == GIDC_REMOVAL as usize => {
+            ctx.captured_devices.remove(&(l as usize));
             ctx.touchpad.removed(l as usize);
             ctx.bursts.remove(&(l as usize));
             ctx.absolute.remove(&(l as usize));

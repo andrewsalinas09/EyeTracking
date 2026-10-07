@@ -1166,6 +1166,7 @@ pub fn run() {
             ..zeroed()
         };
         RegisterClassW(&wc);
+        let _archive = crate::capture::Archive::start_app();
         let report = Report::load_latest();
         let correction = report.as_ref().is_some_and(|r| r.metrics.recommend);
         APP.with(|a| {

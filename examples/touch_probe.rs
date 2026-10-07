@@ -2,6 +2,8 @@
 //! Runs for 60 seconds; does not inject input or change the active controller.
 #![allow(dead_code)]
 #![windows_subsystem = "windows"]
+#[path = "../src/capture.rs"]
+mod capture;
 #[path = "../src/touchpad.rs"]
 mod touchpad;
 use serde_json::json;

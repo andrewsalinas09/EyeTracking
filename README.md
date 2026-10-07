@@ -286,8 +286,9 @@ Each monitor and fixed calibration mapping has its own profile. Restarting or re
 restores the matching map; switching calibration loads its corresponding profile.
 Starting and cancelling calibration preserves existing learning. Recent evidence expires
 after 5 minutes, but the learned map remains until reset or subsequent corrections change it.
-Reset asks **Are you sure?**, defaults to Cancel, and clears all profiles and database
-click samples only after confirmation. It keeps fixed calibration and old diagnostic journals.
+Reset asks **Are you sure?**, defaults to Cancel, and clears all profiles and active
+training click samples only after confirmation. It keeps the research archive,
+fixed calibration and old diagnostic journals.
 SQLite transactions save evidence and map together on a worker thread; ordered reset
 prevents queued saves from restoring erased data. The dashboard reports database errors.
 It does not rewrite the saved model or record browsing contents.
@@ -322,6 +323,106 @@ is also saved at normal exit. Use **Open saved JSONL…** to inspect another run
 Both files remain under `recordings/`. The viewer includes the map restored from SQLite
 at session start and supports older 7×5 journals. Legacy journals are not automatically
 imported into the database; persistent learning begins with this version.
+
+### Research archive (database schema 2)
+
+`recordings/learning.sqlite3` also keeps a continuous, losslessly compressed research
+archive while the app is running, independently of whether an attempt trains the
+live model. Pausing gaze control or freezing learning does not stop recording.
+There is no automatic age-based deletion. A schema-1 database is backed up as
+`learning.v1-backup.sqlite3` before its additive migration; old rows retain their
+original limited information. Missing historical signals cannot be reconstructed.
+
+Recorded information:
+
+- Every delivered gaze point, including invalid samples and off-screen coordinates;
+  head position/rotation with individual validity flags; left/right gaze origins;
+  optional normalized eye position, user-position guide, and presence. Advanced
+  per-eye gaze, eyeball centers and pupil diameter are subscribed when the runtime
+  permits them. Subscription results explicitly distinguish unavailable streams.
+- Original SDK timestamps, callback-enqueue wall/monotonic/Windows uptime clocks,
+  input-message timestamps and processing delays. Reconnect IDs distinguish clock
+  discontinuities. Original float bits preserve NaN/Infinity and invalid raw values
+  whose JSON numeric representation is null. Callback time is not camera exposure
+  time; this archive makes no sub-millisecond hardware synchronization guarantee.
+- Every received raw mouse movement/button/wheel packet, its device handle/source,
+  cursor position, modifiers, foreground/root window handles, click-window bounds/DPI,
+  device paths and available mouse/HID identity/capability metadata,
+  and controller state. This includes clicks without a gaze jump, rejected clicks,
+  button-down/up, drag trajectories and movement after the learning deadline.
+- Raw touchpad HID reports, Windows preparsed descriptor data, decoded contact IDs
+  and normalized positions, contact/button/scroll/arming state. These reports are
+  independent streams; join by session and time rather than assuming a click label.
+- Gaze jumps: cursor before warp, original gaze/pose evidence, fixed-calibrated
+  unclamped position, learned offset, unclamped prediction, requested and actual
+  landing, clipping, source, timestamps, success/failure. Attempts keep their
+  original estimate through edge corrections, plus click target, path, duration,
+  rejection reason and update result. The current learner still rejects clamped
+  edge landings; the archive retains them for future algorithms.
+- Calibration reports (including known fitting/check targets and their samples),
+  full correction-map contexts and changed fields, algorithm rules, preferences,
+  pointer speed/acceleration, display rectangles, tracker model/firmware/runtime,
+  application version, Git revision and compiled-source fingerprint.
+
+The archive contains numeric tracker outputs, **not eye-camera images, screenshots,
+screen content, or typed text**. It supports future models of gaze/pose/correction;
+an image-based gaze network would require a separately available image source and
+new collection. Missing/unsupported streams are not fabricated. Clicks remain
+heuristic labels; stored data is not automatically ground truth.
+
+Tables and replay:
+
+| Table | Contents |
+| --- | --- |
+| `capture_sessions` | Build, coordinate/clock conventions, recording policy and start/end metadata |
+| `capture_batches` | Full event envelopes as zlib-compressed UTF-8 JSONL, indexed by session and time |
+| `capture_index` | Queryable jumps, button events, attempts, contexts, settings, capabilities and gap reports |
+| `profiles`, `click_samples` | Existing live-learning state and accepted training labels |
+
+Each full event has `schema`, `seq`, `mono_us`, `wall_ms`, `uptime_ms`, `kind`,
+`interaction`, and an extensible `data` object. Interaction IDs are session-scoped;
+on mouse events they identify the most recent jump, not a guarantee of eligibility.
+Read `(session, seq)` to join an indexed summary to its full batch event. Dense
+`field` arrays are omitted from index summaries only, marked `field_in_batch`.
+Use timestamps to align independent streams, preserving their original validity.
+Concurrent producers can enqueue out of sequence; sort within sessions as needed.
+
+```powershell
+cargo run --example capture_export -- --stats
+cargo run --example capture_export -- --output work/research.jsonl
+cargo run --example capture_export -- --session SESSION_ID --output work/session.jsonl
+```
+
+The exporter opens SQLite read-only, refuses to overwrite an existing output,
+and streams one batch at a time. Statistics include event/click counts, compression,
+recorded time and a million-click projection at the observed activity rate. A
+click count alone cannot determine disk use: continuous gaze/head streams accrue
+between clicks, and high-rate mice/trackpads add more events. Projections from short
+sessions have fixed-overhead and activity-rate uncertainty; WAL temporary space and
+legacy diagnostic journals/HTML are additional.
+
+An initial ET5 measurement (2026-10-06, 33 Hz, roughly seven minutes, some
+trackpad/click activity) recorded 61,401 events without a reported gap. Compressed
+stream rates varied around 13–17 KB/s while tracking; invalid/static samples can
+compress smaller. At that rate the stream portion of one million clicks would
+occupy about 65–85 GB if clicks average five seconds apart, or 390–510 GB if they
+average thirty seconds apart. These are decimal GB estimates, not storage limits:
+SQLite pages/indexes, input activity, accepted labels and map updates add space.
+Sixty-four existing dense map updates averaged about 26 KB compressed each;
+their legacy JSONL plus HTML copies averaged another 247 KB per update. Thus one
+million actual map updates could add roughly 273 GB for map histories alone.
+A click that does not change the map does not incur that full-map cost. Longer
+idle recording adds streams without adding clicks. The running app used roughly
+33 MiB working-set RAM in this short check; it does not load the lifetime archive.
+
+Input producers never wait for disk. The research queue holds at most 8 MiB of
+encoded event data (plus serialization, compression and worker overhead); batches
+are submitted for saving every 250 ms, or sooner at 512 events/512 KiB. Disk latency
+can delay completion. Overflow or write failure increments
+a visible cumulative loss count and writes a `capture_gap` when storage recovers.
+Normal exit drains the queue. Abrupt termination can lose queued data; a missing
+session end marks an unclean exit. Research history stays on disk; HTML history
+generation streams the journal instead of retaining every learned field in RAM.
 
 ### Gaze-directed scrolling
 

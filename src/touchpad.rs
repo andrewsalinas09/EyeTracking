@@ -42,6 +42,8 @@ impl Landing {
 }
 #[derive(Default, serde::Serialize)]
 pub struct Frame {
+    pub points: Vec<[f64; 3]>,
+    pub button: bool,
     pub contacts: Option<usize>,
     pub started: bool,
     pub armed: bool,
@@ -154,6 +156,7 @@ unsafe fn usages(
 }
 impl Device {
     unsafe fn new(handle: HANDLE) -> Option<Self> {
+        crate::capture::input_device(handle);
         let mut size = 0;
         if GetRawInputDeviceInfoW(handle, RIDI_PREPARSEDDATA, null_mut(), &mut size) == u32::MAX
             || size == 0
@@ -201,6 +204,13 @@ impl Device {
         }
         slots.sort_unstable();
         slots.dedup();
+        crate::capture::record(
+            "touchpad_descriptor",
+            None,
+            serde_json::json!({"device_handle":handle as usize,
+            "preparsed_data":std::slice::from_raw_parts(pp.as_ptr() as *const u8,size as usize),
+            "usage_page":caps.UsagePage,"usage":caps.Usage,"input_report_bytes":caps.InputReportByteLength,"contact_slots":slots,"xy_ranges":ranges}),
+        );
         if slots.is_empty() || ranges.iter().any(|r| r[1] <= r[0]) {
             return None;
         }
@@ -261,6 +271,11 @@ impl Device {
         let trigger = self.gesture.frame(&contacts, blocked || button);
         self.landing.frame(contacts.len(), blocked || button);
         Some(Frame {
+            points: contacts
+                .iter()
+                .map(|c| [c.id as f64, c.xy[0], c.xy[1]])
+                .collect(),
+            button,
             contacts: Some(contacts.len()),
             started,
             armed: self.landing.pending,
@@ -352,6 +367,13 @@ impl Touchpad {
         {
             return Some(Vec::new());
         }
+        crate::capture::record(
+            "raw_hid",
+            None,
+            serde_json::json!({"device_handle":header.hDevice as usize,
+            "input_message_tick_ms":windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime() as u32,
+            "report_size":report_size,"report_count":count,"bytes":&bytes[offset..offset+report_size*count],"blocked":blocked}),
+        );
         let Some(dev) = self
             .devices
             .entry(header.hDevice as usize)
@@ -364,6 +386,13 @@ impl Touchpad {
             let frame = dev
                 .frame(report, blocked)
                 .unwrap_or_else(|| dev.uncertain());
+            crate::capture::record(
+                "touchpad",
+                None,
+                serde_json::json!({"device_handle":header.hDevice as usize,
+                "input_message_tick_ms":windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime() as u32,
+                    "frame":frame,"blocked":blocked}),
+            );
             self.reports += 1;
             self.gestures += u64::from(frame.scroll_start);
             frames.push(frame);

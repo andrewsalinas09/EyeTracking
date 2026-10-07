@@ -30,6 +30,7 @@ struct Node {
 }
 
 struct Attempt {
+    interaction: u64,
     evidence: Option<crate::pose::Evidence>,
     time: u32,
     base: XY,
@@ -81,6 +82,7 @@ pub struct Learner {
     store: Option<Store>,
     context_key: Option<String>,
     storage_error: String,
+    interaction: Option<u64>,
 }
 impl Default for Learner {
     fn default() -> Self {
@@ -100,6 +102,7 @@ impl Default for Learner {
             store: None,
             context_key: None,
             storage_error: String::new(),
+            interaction: None,
         }
     }
 }
@@ -150,7 +153,11 @@ impl Learner {
             demo: false,
         });
     }
-    pub fn record_jump(&self, source: &str, success: bool) {
+    pub fn interaction(&self) -> Option<u64> {
+        self.interaction
+    }
+    pub fn record_jump(&mut self, source: &str, success: bool) {
+        self.interaction = Some(crate::capture::interaction_id());
         if let Some(log) = &self.recorder {
             log.record(json!({"kind":"jump", "source":source, "success":success}));
         }
@@ -179,9 +186,15 @@ impl Learner {
         if !self.storage_error.is_empty() {
             return format!("Learning database error: {}", self.storage_error);
         }
-        self.store
+        let storage = self
+            .store
             .as_ref()
-            .map_or_else(|| "Learning is not saved".into(), Store::status)
+            .map_or_else(|| "Learning is not saved".into(), Store::status);
+        if storage.contains("error") || self.store.is_none() {
+            storage
+        } else {
+            crate::capture::status().unwrap_or(storage)
+        }
     }
     pub fn change_context(
         &mut self,
@@ -296,10 +309,14 @@ impl Learner {
         display: &crate::calibration::Display,
         model: Option<&crate::calibration::Model>,
     ) {
-        if let Some(log) = &self.recorder {
-            log.record(json!({"kind":"context", "schema":1, "epoch":self.epoch,
+        let data = json!({"kind":"context", "schema":1, "epoch":self.epoch,
                 "display":display, "base_model":model, "grid":[COLS,ROWS], "field":self.field.as_slice(),
-                "coordinates":"physical desktop pixels; base gaze is after fixed calibration"}));
+                "coordinates":"physical desktop pixels; base gaze is after fixed calibration",
+                "learner":"spatial-v2.1", "rules":{"max_click_ms":MAX_CLICK_MS,"max_correction_px":MAX_CORRECTION,"max_path_px":600,"min_click_ms":80,"max_hold_ms":500,"max_drag_px":4,
+                    "max_step_px":MAX_STEP,"max_offset_px":MAX_OFFSET,"consensus_radius_px":CONSENSUS_RADIUS,"history_ms":HISTORY_MS,"max_labels":MAX_LABELS,"enabled":self.enabled}});
+        crate::capture::record("context", None, data.clone());
+        if let Some(log) = &self.recorder {
+            log.record(data);
         }
     }
     pub fn open_map(&self) -> Result<(), String> {
@@ -314,13 +331,18 @@ impl Learner {
             .map_or_else(|| self.recording_error.clone(), |r| r.status())
     }
     fn record_attempt(&self, p: &Attempt, accepted: bool, updated: bool, reason: &str) {
-        if let Some(log) = &self.recorder {
-            log.record(json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
+        let data = json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
                 "base":p.base, "landing":p.landing, "target":p.down.map(|(_,target)|target),
                 "last":p.last, "path_px":p.path, "accepted":accepted, "updated":updated,
                 "status":reason, "elapsed_ms":p.last_time.wrapping_sub(p.time),
                 "last_input_flags":p.last_flags, "landing_surface":p.surface,"last_surface":p.last_surface,
-                "grid":[COLS,ROWS], "field":updated.then_some(self.field.as_slice()), "evidence":p.evidence}));
+                "jump_tick_ms":p.time,"end_tick_ms":p.last_time,"button_down_tick_ms":p.down.map(|(t,_)|t),
+                "click_delay_ms":p.down.map(|(t,_)|t.wrapping_sub(p.time)),"drag_path_px":p.drag_path,
+                "button_up_observed":p.last_flags&2!=0,"interaction":p.interaction,
+                "grid":[COLS,ROWS], "field":updated.then_some(self.field.as_slice()), "evidence":p.evidence});
+        crate::capture::record("attempt", Some(p.interaction), data.clone());
+        if let Some(log) = &self.recorder {
+            log.record(data);
         }
     }
     /// Bilinear interpolation gives a continuous correction, without snapping
@@ -369,6 +391,11 @@ impl Learner {
         self.recorder = recorder;
         self.recording_error = error;
         self.epoch = epoch;
+        crate::capture::record(
+            "learning_reset",
+            None,
+            json!({"epoch":epoch,"research_archive_retained":true}),
+        );
         if let Some(log) = &self.recorder {
             log.record(json!({"kind":"reset", "epoch":epoch, "grid":[COLS,ROWS], "field":self.field.as_slice()}));
         }
@@ -398,10 +425,28 @@ impl Learner {
     }
     pub fn begin(&mut self, now: u32, base: XY, landing: XY, surface: usize, rect: [i32; 4]) {
         self.cancel("Replaced by next jump");
-        if !self.enabled || surface == 0 || !interior(base, rect) || !interior(landing, rect) {
+        if !base.iter().chain(landing.iter()).all(|v| v.is_finite()) {
             return;
         }
+        let interaction = *self
+            .interaction
+            .get_or_insert_with(crate::capture::interaction_id);
+        let rejection = if !self.enabled {
+            Some("Skipped: learning frozen")
+        } else if surface == 0 {
+            Some("Skipped: no target surface")
+        } else if !interior(base, rect) || !interior(landing, rect) {
+            Some("Skipped: edge landing")
+        } else {
+            None
+        };
+        crate::capture::record(
+            "attempt_started",
+            Some(interaction),
+            json!({"base":base,"landing":landing,"rect":rect,"surface":surface,"jump_tick_ms":now,"initial_rejection":rejection,"epoch":self.epoch}),
+        );
         self.pending = Some(Attempt {
+            interaction,
             evidence: None,
             time: now,
             base,
@@ -415,13 +460,14 @@ impl Learner {
             rect,
             down: None,
             drag_path: 0.0,
-            rejection: None,
+            rejection,
         });
         self.status = "Watching correction + click";
     }
     pub fn attach_evidence(&mut self, evidence: crate::pose::Evidence) {
         if let Some(p) = &mut self.pending {
             p.evidence = Some(evidence);
+            crate::capture::record("jump_evidence", Some(p.interaction), json!(evidence));
         }
     }
     /// Flags are Win32 raw mouse left-down/up bits 1/2. All other buttons and
@@ -830,6 +876,20 @@ mod tests {
             learner.take_feedback().unwrap().reason,
             "Skipped: held click"
         );
+    }
+    #[test]
+    fn offscreen_landings_preserve_the_correction_even_when_not_used_for_learning() {
+        let mut learner = Learner::default();
+        learner.begin(0, [100., 2300.], [100., 2159.], 1, RECT);
+        let pending = learner.pending.as_ref().unwrap();
+        assert_eq!(pending.base, [100., 2300.]);
+        assert_eq!(pending.rejection, Some("Skipped: edge landing"));
+        learner.event(100, [100., 2110.], 1, 2);
+        learner.event(200, [100., 2110.], 2, 2);
+        let feedback = learner.take_feedback().unwrap();
+        assert_eq!(feedback.selection, Some([100., 2110.]));
+        assert_eq!(feedback.reason, "Skipped: edge landing");
+        assert_eq!(learner.accepted, 0);
     }
     #[test]
     fn no_correction_clicks_counter_bias_and_reset_and_freeze_work() {

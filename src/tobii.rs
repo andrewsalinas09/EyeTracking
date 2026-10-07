@@ -137,6 +137,7 @@ struct Engine {
 impl Engine {
     // All API calls and callbacks stay on the owning worker thread.
     unsafe fn connect(shared: &Arc<Mutex<State>>) -> Result<Self, String> {
+        crate::tobii_capture::connected_attempt();
         let path = std::env::var_os("TOBII_STREAM_ENGINE_DLL")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -186,6 +187,10 @@ impl Engine {
             "{}.{}.{}.{}",
             version.major, version.minor, version.revision, version.build
         );
+        crate::tobii_capture::record(
+            "tracker_runtime",
+            serde_json::json!({"version":shared.lock().unwrap().version,"library":path}),
+        );
         let result = create(&mut engine.api, null(), null());
         engine.check(result, "Create API")?;
         let mut urls: Vec<CString> = Vec::new();
@@ -208,6 +213,10 @@ impl Engine {
             "Subscribe to gaze",
         )?;
         engine.subscribed = true;
+        crate::tobii_capture::record(
+            "stream_availability",
+            serde_json::json!({"stream":"gaze_point","available":true,"subscribe_code":0}),
+        );
         {
             let mut state = shared.lock().unwrap();
             state.heads.clear();
@@ -227,12 +236,29 @@ impl Engine {
                 ._library
                 .get::<Destroy>(format!("tobii_{name}_unsubscribe\0").as_bytes());
             if let (Ok(sub), Ok(unsub)) = (subscribe, unsubscribe) {
-                if sub(engine.device, callback, Arc::as_ptr(shared) as *mut c_void) == 0 {
+                let code = sub(engine.device, callback, Arc::as_ptr(shared) as *mut c_void);
+                crate::tobii_capture::record(
+                    "stream_availability",
+                    serde_json::json!({"stream":name,"subscribe_code":code,"available":code==0}),
+                );
+                if code == 0 {
                     engine.pose_unsubscribers.push(*unsub);
                     available.push(name);
                 }
+            } else {
+                crate::tobii_capture::record(
+                    "stream_availability",
+                    serde_json::json!({"stream":name,"available":false,"missing_symbol":true}),
+                );
             }
         }
+        engine
+            .pose_unsubscribers
+            .extend(crate::tobii_capture::subscribe(
+                &engine._library,
+                engine.device,
+                Arc::as_ptr(shared) as *mut c_void,
+            ));
         shared.lock().unwrap().pose_status = format!("Pose streams: {}", available.join(", "));
         shared.lock().unwrap().status = "Connected".into();
         Ok(engine)
@@ -278,6 +304,10 @@ unsafe extern "C" fn receive_head(data: *const c_void, context: *mut c_void) {
         return;
     }
     let p = &*data.cast::<HeadPose>();
+    crate::tobii_capture::record(
+        "head_pose",
+        serde_json::json!({"sdk_timestamp_us":p.timestamp_us,"position_validity":p.position_validity,"rotation_validity":p.rotation_validity,"position_mm":p.position,"rotation_radians":p.rotation,"position_float_bits":p.position.map(f32::to_bits),"rotation_float_bits":p.rotation.map(f32::to_bits)}),
+    );
     if let Ok(mut state) = (&*context.cast::<Mutex<State>>()).lock() {
         let valid = p.position_validity == 1
             && p.rotation_validity.iter().all(|v| *v == 1)
@@ -302,6 +332,10 @@ unsafe extern "C" fn receive_origin(data: *const c_void, context: *mut c_void) {
         return;
     }
     let p = &*data.cast::<GazeOrigin>();
+    crate::tobii_capture::record(
+        "gaze_origin",
+        serde_json::json!({"sdk_timestamp_us":p.timestamp_us,"left_validity":p.left_validity,"right_validity":p.right_validity,"left_mm":p.left,"right_mm":p.right,"left_float_bits":p.left.map(f32::to_bits),"right_float_bits":p.right.map(f32::to_bits)}),
+    );
     if let Ok(mut state) = (&*context.cast::<Mutex<State>>()).lock() {
         let left = (p.left_validity == 1 && p.left.iter().all(|v| v.is_finite()))
             .then_some(p.left.map(f64::from));
@@ -324,6 +358,10 @@ unsafe extern "C" fn receive_gaze(point: *const GazePoint, context: *mut c_void)
         return;
     }
     let p = *point;
+    crate::tobii_capture::record(
+        "gaze",
+        serde_json::json!({"sdk_timestamp_us":p.timestamp_us,"validity":p.validity,"xy":p.xy,"xy_float_bits":p.xy.map(f32::to_bits)}),
+    );
     let shared = &*(context as *const Mutex<State>);
     // Never unwind across the C callback boundary.
     if let Ok(mut state) = shared.lock() {
@@ -363,13 +401,23 @@ impl Worker {
                                 engine.check((engine.process)(engine.device), "Read gaze")
                             };
                             if let Err(error) = result {
+                                crate::tobii_capture::record(
+                                    "tracker_error",
+                                    serde_json::json!({"error":error}),
+                                );
                                 shared.lock().unwrap().status = error;
                                 break;
                             }
                             thread::sleep(Duration::from_millis(4));
                         }
                     }
-                    Err(error) => shared.lock().unwrap().status = error,
+                    Err(error) => {
+                        crate::tobii_capture::record(
+                            "tracker_error",
+                            serde_json::json!({"error":error}),
+                        );
+                        shared.lock().unwrap().status = error;
+                    }
                 }
                 // Retry without blocking shutdown for the entire retry interval.
                 for _ in 0..20 {
