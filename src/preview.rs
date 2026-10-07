@@ -12,8 +12,15 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+mod dashboard;
+mod tray;
 
 struct App {
+    control_font: HFONT,
+    overview: bool,
+    tray: Option<tray::Tray>,
+    preferences: crate::preferences::Preferences,
+    last_ui: Instant,
     mouse: Option<crate::mouse::Controller>,
     worker: Worker,
     trail: bool,
@@ -26,6 +33,15 @@ struct App {
     show_report: bool,
     correction: bool,
     notice: String,
+}
+impl Drop for App {
+    fn drop(&mut self) {
+        if !self.control_font.is_null() {
+            unsafe {
+                DeleteObject(self.control_font);
+            }
+        }
+    }
 }
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
 fn wide(text: &str) -> Vec<u16> {
@@ -67,7 +83,8 @@ unsafe fn update_calibration(hwnd: HWND, app: &mut App) {
                 mouse.calibration(false, None);
             }
             app.notice =
-                "Calibration cancelled because the display changed. Press C to restart.".into();
+                "Calibration cancelled because the display changed. Select Calibrate to restart."
+                    .into();
             return;
         }
         if GetForegroundWindow() != hwnd {
@@ -491,12 +508,12 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
             px(68.0),
             px(15.0),
             dim,
-            "Look at the bright dot, press Space, and keep looking until it moves.",
+            "Look at the bright dot. Press Space or select Capture dot, then keep looking until it moves.",
         );
         label(
             back.dc,
             px(30.0),
-            h - px(98.0),
+            h - px(142.0),
             px(17.0),
             teal,
             &session.notice,
@@ -504,7 +521,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
         label(
             back.dc,
             px(30.0),
-            h - px(68.0),
+            h - px(112.0),
             px(14.0),
             dim,
             &format!(
@@ -517,7 +534,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
             h - px(39.0),
             px(14.0),
             dim,
-            "Space  Capture this dot     Esc  Cancel calibration",
+            "Space captures a dot without moving the pointer. Esc returns to Overview.",
         );
     } else if report_visible {
         let report = app.report.as_ref().unwrap();
@@ -555,11 +572,11 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 m.corrected_worst_target_px
             ),
         );
-        label(back.dc,px(30.0),h-px(130.0),px(16.0),white,"White: check target    Orange: original mean    Mint: corrected mean    Grey: fit samples    Red: outliers");
+        label(back.dc,px(30.0),h-px(184.0),px(14.0),white,"White: target    Orange: original    Mint: corrected    Grey: fitting samples    Red: outliers");
         label(
             back.dc,
             px(30.0),
-            h - px(98.0),
+            h - px(154.0),
             px(17.0),
             if m.recommend { teal } else { rgb(248, 181, 99) },
             &format!(
@@ -572,8 +589,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 if correction_active { "ON" } else { "OFF" }
             ),
         );
-        label(back.dc, px(30.0), h - px(68.0), px(14.0), dim, &app.notice);
-        label(back.dc,px(30.0),h-px(39.0),px(14.0),dim,"R  Live preview / results     A  Compare correction on/off     C  New calibration     Esc  Live preview");
+        label(back.dc, px(30.0), h - px(124.0), px(13.0), dim, &app.notice);
     } else {
         label(back.dc, px(30.0), px(25.0), px(30.0), white, "Gaze preview");
         label(
@@ -582,7 +598,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
             px(68.0),
             px(15.0),
             dim,
-            "Look at the fixed dots. Press C to measure and correct the gaze map.",
+            "Explore your gaze across the screen, or select Calibrate to measure its accuracy.",
         );
         let message = if status != "Connected" {
             status.clone()
@@ -594,7 +610,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
             if sample.xy.iter().any(|v| *v < 0.0 || *v > 1.0) {
                 "Tracking · gaze is outside this display".into()
             } else if p[0] < 0.0 || p[1] < 0.0 || p[0] >= w as f32 || p[1] >= h as f32 {
-                "Tracking · gaze is outside this window (F11 for full screen)".into()
+                "Tracking · gaze is outside this window. Select Full screen to see the whole display.".into()
             } else if app.hidden {
                 "Tracking · gaze marker hidden".into()
             } else {
@@ -607,7 +623,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
         label(
             back.dc,
             px(30.0),
-            h - px(98.0),
+            h - px(161.0),
             px(17.0),
             if live.is_some() {
                 teal
@@ -619,7 +635,7 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
         label(
             back.dc,
             px(30.0),
-            h - px(68.0),
+            h - px(132.0),
             px(14.0),
             dim,
             &format!(
@@ -628,7 +644,6 @@ unsafe fn paint(hwnd: HWND, app: &mut App) {
                 area.bottom - area.top
             ),
         );
-        label(back.dc,px(30.0),h-px(39.0),px(14.0),dim,"C  Calibrate   R  Results   L  Learning map   A  Correction   F11  Full screen   M  Display   Esc  Close");
         if !app.notice.is_empty() {
             label(back.dc, px(30.0), px(98.0), px(14.0), dim, &app.notice);
         }
@@ -651,7 +666,11 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info);
-        SetWindowLongW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as i32);
+        SetWindowLongW(
+            hwnd,
+            GWL_STYLE,
+            (WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN) as i32,
+        );
         let r = info.rcMonitor;
         SetWindowPos(
             hwnd,
@@ -664,7 +683,11 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         );
     } else {
         let saved = APP.with(|a| a.borrow().as_ref().map(|a| a.saved));
-        SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as i32);
+        SetWindowLongW(
+            hwnd,
+            GWL_STYLE,
+            (WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN) as i32,
+        );
         if let Some(saved) = saved {
             SetWindowPlacement(hwnd, &saved);
         }
@@ -724,18 +747,121 @@ unsafe fn next_monitor(hwnd: HWND) {
     }
 }
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let restart = msg >= 0xc000
+        && APP.with(|a| {
+            a.borrow()
+                .as_ref()
+                .and_then(|a| a.tray.as_ref())
+                .is_some_and(|t| t.restart_message != 0 && msg == t.restart_message)
+        });
+    if restart {
+        let available = APP.with(|a| {
+            let mut a = a.borrow_mut();
+            if let Some(t) = a.as_mut().and_then(|a| a.tray.as_mut()) {
+                t.add();
+                t.available
+            } else {
+                false
+            }
+        });
+        if !available {
+            dashboard::home(hwnd);
+        }
+        return 0;
+    }
     match msg {
+        tray::OPEN => {
+            dashboard::home(hwnd);
+            0
+        }
+        tray::CALLBACK => {
+            tray::callback(hwnd, w, l);
+            0
+        }
+        WM_CLOSE => {
+            dashboard::hide(hwnd);
+            0
+        }
+        WM_COMMAND => {
+            dashboard::command(hwnd, (w & 0xffff) as u32);
+            0
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => dashboard::edit_colors(w as HDC),
+        WM_DRAWITEM => {
+            dashboard::draw_button(
+                &*(l as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT),
+            );
+            1
+        }
+        WM_SIZE => {
+            dashboard::layout(hwnd);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
         WM_CREATE => {
             SetTimer(hwnd, 1, 16, None);
             0
         }
         WM_TIMER => {
-            APP.with(|a| {
+            let (repaint, refresh, layout) = APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
+                    let session = app.session.is_some();
                     update_calibration(hwnd, app);
+                    let refresh = app.last_ui.elapsed() >= Duration::from_millis(250);
+                    if refresh {
+                        app.last_ui = Instant::now();
+                        if let Some(mouse) = &app.mouse {
+                            let s = mouse.snapshot();
+                            let prefs = crate::preferences::Preferences {
+                                enabled: s.enabled,
+                                dot: s.dot,
+                                scroll: s.scroll,
+                                learning: s.learning,
+                                mouse_rearm_ms: s.mouse_rearm_ms,
+                                trackpad_rearm_ms: s.trackpad_rearm_ms,
+                            };
+                            if prefs != app.preferences {
+                                match prefs.save() {
+                                    Ok(()) => app.preferences = prefs,
+                                    Err(e) => {
+                                        app.notice = format!("Could not save preferences: {e}")
+                                    }
+                                }
+                            }
+                            if let Some(t) = app.tray.as_mut() {
+                                let state = app.worker.state.lock().unwrap();
+                                let live = state
+                                    .samples
+                                    .back()
+                                    .is_some_and(|p| is_live(p, Instant::now()));
+                                t.set_tip(if !s.enabled {
+                                    "EyeTracking — paused"
+                                } else if !s.display_ok {
+                                    "EyeTracking — display setup changed"
+                                } else if !live {
+                                    "EyeTracking — waiting for gaze"
+                                } else {
+                                    "EyeTracking — gaze control active"
+                                });
+                            }
+                        }
+                    }
+                    (
+                        !app.overview || refresh,
+                        refresh,
+                        session != app.session.is_some(),
+                    )
+                } else {
+                    (false, false, false)
                 }
             });
-            if IsIconic(hwnd) == 0 {
+            if layout {
+                dashboard::layout(hwnd);
+            }
+            if refresh {
+                dashboard::refresh(hwnd);
+            }
+            if repaint && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
                 InvalidateRect(hwnd, null(), 0);
             }
             0
@@ -744,14 +870,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_PAINT => {
             APP.with(|a| {
                 if let Some(app) = a.borrow_mut().as_mut() {
-                    paint(hwnd, app);
+                    if app.overview {
+                        dashboard::paint(hwnd, app);
+                    } else {
+                        paint(hwnd, app);
+                    }
                 }
             });
             0
         }
         WM_GETMINMAXINFO => {
             let info = &mut *(l as *mut MINMAXINFO);
-            info.ptMinTrackSize = POINT { x: 850, y: 480 };
+            let scale = GetDpiForWindow(hwnd) as f32 / 96.;
+            info.ptMinTrackSize = POINT {
+                x: (960. * scale) as i32,
+                y: (760. * scale) as i32,
+            };
             0
         }
         WM_DPICHANGED => {
@@ -765,6 +899,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 r.bottom - r.top,
                 SWP_NOZORDER,
             );
+            dashboard::fonts(hwnd);
+            dashboard::layout(hwnd);
             0
         }
         WM_KEYDOWN => {
@@ -786,26 +922,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                                 if let Some(mouse) = &a.mouse {
                                     mouse.calibration(false, None);
                                 }
-                                a.notice = "Calibration cancelled. Press C to start again.".into();
+                                a.notice =
+                                    "Calibration cancelled. Select Calibrate to start again."
+                                        .into();
                             }
                             _ => {}
                         }
                     }
                 });
+                dashboard::layout(hwnd);
                 return 0;
             }
             match w as u32 {
                 0x1B => {
-                    let showing = APP.with(|a| a.borrow().as_ref().is_some_and(|a| a.show_report));
-                    if showing {
-                        APP.with(|a| {
-                            if let Some(a) = a.borrow_mut().as_mut() {
-                                a.show_report = false;
-                            }
-                        });
-                    } else {
-                        DestroyWindow(hwnd);
-                    }
+                    dashboard::home(hwnd);
                 }
                 0x43 => {
                     if GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_OVERLAPPEDWINDOW != 0 {
@@ -814,6 +944,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     let current = display(hwnd);
                     APP.with(|a| {
                         if let Some(a) = a.borrow_mut().as_mut() {
+                            a.overview = false;
                             a.session = Some(Session::new(current));
                             if let Some(mouse) = &a.mouse {
                                 mouse.calibration(true, None);
@@ -857,9 +988,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     }
                 }),
             }
+            dashboard::layout(hwnd);
+            dashboard::refresh(hwnd);
             0
         }
         WM_DESTROY => {
+            APP.with(|a| {
+                if let Some(a) = a.borrow_mut().as_mut() {
+                    a.tray.take();
+                }
+            });
             KillTimer(hwnd, 1);
             PostQuitMessage(0);
             0
@@ -872,6 +1010,13 @@ pub fn run() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(null());
         let class = wide("EyeTrackingGazePreview");
+        let existing = FindWindowW(class.as_ptr(), null());
+        if !existing.is_null() {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+            PostMessageW(existing, tray::OPEN, 0, 0);
+            return;
+        }
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
@@ -884,6 +1029,11 @@ pub fn run() {
         let correction = report.as_ref().is_some_and(|r| r.metrics.recommend);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
+                control_font: null_mut(),
+                overview: true,
+                tray: None,
+                preferences: crate::preferences::Preferences::load(),
+                last_ui: Instant::now(),
                 mouse: None,
                 worker: Worker::start(),
                 trail: true,
@@ -895,18 +1045,18 @@ pub fn run() {
                 report,
                 show_report: false,
                 correction,
-                notice: "Ctrl+Alt+F6: status panel. W or Ctrl+Alt+F8: gaze mouse.".into(),
+                notice: String::new(),
             })
         });
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("Gaze preview — EyeTracking").as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            wide("EyeTracking").as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1100,
-            760,
+            1040,
+            800,
             null_mut(),
             null_mut(),
             instance,
@@ -920,22 +1070,57 @@ pub fn run() {
                 MB_ICONERROR,
             );
         } else {
+            let dark: BOOL = 1;
+            windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd,
+                windows_sys::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &dark as *const _ as *const _,
+                size_of::<BOOL>() as u32,
+            );
             APP.with(|a| {
                 if let Some(a) = a.borrow_mut().as_mut() {
                     match crate::mouse::Controller::start(
                         a.worker.state.clone(),
                         display(hwnd),
                         a.report.as_ref(),
-                        std::env::args().any(|x| x == "--mouse"),
+                        a.preferences.enabled || std::env::args().any(|x| x == "--mouse"),
                     ) {
-                        Ok(mouse) => a.mouse = Some(mouse),
+                        Ok(mouse) => {
+                            mouse.set_rearm_delay(a.preferences.mouse_rearm_ms);
+                            mouse.set_trackpad_rearm_delay(a.preferences.trackpad_rearm_ms);
+                            if !a.preferences.dot {
+                                mouse.command(4);
+                            }
+                            if !a.preferences.scroll {
+                                mouse.command(6);
+                            }
+                            if !a.preferences.learning {
+                                mouse.command(2);
+                            }
+                            a.mouse = Some(mouse);
+                        }
                         Err(error) => a.notice = error,
                     }
                 }
             });
-            ShowWindow(hwnd, SW_MAXIMIZE);
+            let tray = tray::Tray::new(hwnd);
+            APP.with(|a| {
+                if let Some(a) = a.borrow_mut().as_mut() {
+                    a.tray = Some(tray);
+                }
+            });
+            dashboard::create(hwnd);
+            ShowWindow(hwnd, SW_SHOWNORMAL);
+            SetForegroundWindow(hwnd);
             let mut msg: MSG = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                if msg.message == WM_KEYDOWN && msg.wParam == 0x1b {
+                    dashboard::home(hwnd);
+                    continue;
+                }
+                if IsDialogMessageW(hwnd, &msg) != 0 {
+                    continue;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

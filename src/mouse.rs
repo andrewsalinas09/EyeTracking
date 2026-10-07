@@ -26,8 +26,25 @@ use windows_sys::Win32::{
     },
 };
 
-const IDLE_MS: u32 = 300;
 const TOGGLE: u32 = WM_APP + 1;
+const SET_REARM: u32 = WM_APP + 3; // +2 belongs to scroll::SCROLLED.
+const SET_TRACKPAD_REARM: u32 = WM_APP + 4;
+/// Read-only UI state. Input remains owned by its dedicated thread.
+#[derive(Clone, Default)]
+pub struct Snapshot {
+    pub mouse_rearm_ms: u32,
+    pub trackpad_rearm_ms: u32,
+    pub enabled: bool,
+    pub dot: bool,
+    pub scroll: bool,
+    pub learning: bool,
+    pub display_ok: bool,
+    pub display: String,
+    pub jumps: u64,
+    pub accepted: u64,
+    pub updates: u64,
+    pub error: String,
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PointerSource {
     Touchpad,
@@ -45,13 +62,25 @@ impl PointerSource {
 fn recent_click(last: Option<u32>, now: u32, interval: u32) -> bool {
     last.is_some_and(|t| now.wrapping_sub(t) < interval)
 }
-#[derive(Default)]
+fn cooldown_ready(last: Option<u32>, now: u32, delay: u32) -> bool {
+    last.is_none_or(|t| now.wrapping_sub(t) >= delay)
+}
 struct Burst {
     last: Option<u32>,
+    delay_ms: u32,
+}
+impl Default for Burst {
+    fn default() -> Self {
+        Self {
+            last: None,
+            delay_ms: crate::preferences::DEFAULT_REARM_MS,
+        }
+    }
 }
 impl Burst {
     fn armed(&self, now: u32) -> bool {
-        self.last.is_none_or(|t| now.wrapping_sub(t) >= IDLE_MS)
+        self.last
+            .is_none_or(|t| now.wrapping_sub(t) >= self.delay_ms)
     }
     fn input(&mut self, now: u32, moved: bool, blocked: bool) -> bool {
         let jump = moved && !blocked && self.armed(now);
@@ -62,6 +91,7 @@ impl Burst {
     }
 }
 struct Config {
+    snapshot: Snapshot,
     display: Display,
     model: Option<Model>,
     calibrating: bool,
@@ -104,6 +134,15 @@ impl Controller {
         enabled: bool,
     ) -> Result<Self, String> {
         let config = Arc::new(Mutex::new(Config {
+            snapshot: Snapshot {
+                mouse_rearm_ms: crate::preferences::DEFAULT_REARM_MS,
+                enabled,
+                dot: true,
+                scroll: true,
+                learning: true,
+                display_ok: true,
+                ..Snapshot::default()
+            },
             display: report.map_or(display, |r| r.display.clone()),
             model: report
                 .filter(|r| r.metrics.recommend)
@@ -143,7 +182,11 @@ impl Controller {
                 state,
                 config: cfg,
                 enabled,
+                scroll_enabled: true,
+                mouse_rearm_ms: crate::preferences::DEFAULT_REARM_MS,
                 bursts: HashMap::new(),
+                trackpad_rearm_ms: 0,
+                last_trackpad_landing: None,
                 source: PointerSource::Touchpad,
                 last_click: None,
                 absolute: HashMap::new(),
@@ -183,15 +226,13 @@ impl Controller {
                 dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
                 hwndTarget: hwnd,
             };
-            if RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8 as u32) == 0
-                || RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F9 as u32) == 0
-                || RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10 as u32) == 0
-                || RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7 as u32) == 0
-                || RegisterHotKey(hwnd, 5, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F6 as u32) == 0
-                || RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0
-            {
+            // Shortcuts are optional conveniences; a collision must never disable input.
+            for (id, key) in [(1, VK_F8), (2, VK_F9), (3, VK_F10), (4, VK_F7), (5, VK_F6)] {
+                RegisterHotKey(hwnd, id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, key as u32);
+            }
+            if RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0 {
                 let _ = tx.send(Err(
-                    "Mouse setup failed: raw input or Ctrl+Alt+F6/F7/F8/F9/F10 unavailable".into(),
+                    "Could not register mouse input. Quit and reopen EyeTracking.".into(),
                 ));
                 DestroyWindow(hwnd);
                 return;
@@ -232,6 +273,25 @@ impl Controller {
     pub fn toggle(&self) {
         unsafe {
             PostMessageW(self.hwnd as HWND, TOGGLE, 0, 0);
+        }
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        self.config.lock().unwrap().snapshot.clone()
+    }
+    pub fn set_rearm_delay(&self, ms: u32) {
+        unsafe {
+            PostMessageW(self.hwnd as HWND, SET_REARM, ms as usize, 0);
+        }
+    }
+    pub fn set_trackpad_rearm_delay(&self, ms: u32) {
+        unsafe {
+            PostMessageW(self.hwnd as HWND, SET_TRACKPAD_REARM, ms as usize, 0);
+        }
+    }
+    /// Same commands as the optional hotkeys, dispatched on the input thread.
+    pub fn command(&self, id: usize) {
+        unsafe {
+            PostMessageW(self.hwnd as HWND, WM_HOTKEY, id, 0);
         }
     }
     pub fn correction(&self, report: &Report, enabled: bool) {
@@ -281,6 +341,10 @@ impl Drop for Controller {
     }
 }
 struct Context {
+    trackpad_rearm_ms: u32,
+    last_trackpad_landing: Option<u32>,
+    mouse_rearm_ms: u32,
+    scroll_enabled: bool,
     touchpad: crate::touchpad::Touchpad,
     dot: crate::gaze_dot::GazeDot,
     dot_visible: bool,
@@ -309,9 +373,12 @@ unsafe fn surface_at(point: POINT) -> usize {
     GetAncestor(WindowFromPoint(point), GA_ROOT) as usize
 }
 impl Context {
+    fn trackpad_ready(&self, now: u32) -> bool {
+        cooldown_ready(self.last_trackpad_landing, now, self.trackpad_rearm_ms)
+    }
     fn armed(&self, now: u32) -> bool {
         match self.source {
-            PointerSource::Touchpad => self.touchpad.armed(),
+            PointerSource::Touchpad => self.touchpad.armed() && self.trackpad_ready(now),
             PointerSource::Mouse(device) => self.bursts.get(&device).is_none_or(|b| b.armed(now)),
         }
     }
@@ -350,7 +417,12 @@ impl Context {
                 || buttons_down()
                 || recent_click(self.last_click, GetTickCount(), GetDoubleClickTime()),
         ) {
-            crate::scroll::update(allowed, point, GetTickCount());
+            // Suppress only landing during the cooldown. Two-finger scrolling
+            // remains independent, and a held contact can never jump later.
+            if !self.trackpad_ready(GetTickCount()) {
+                self.touchpad.motion(false, true);
+            }
+            crate::scroll::update(allowed && self.scroll_enabled, point, GetTickCount());
             for frame in frames {
                 if frame.started || frame.scroll_start {
                     self.source = PointerSource::Touchpad;
@@ -433,15 +505,23 @@ impl Context {
             || !self.display_ok
             || GetTickCount().wrapping_sub(now) > 100;
         let jump = match source {
-            PointerSource::Touchpad => self.touchpad.motion(moved, blocked),
+            PointerSource::Touchpad => self
+                .touchpad
+                .motion(moved, blocked || !self.trackpad_ready(now)),
             PointerSource::Mouse(device) => self
                 .bursts
                 .entry(device)
-                .or_default()
+                .or_insert(Burst {
+                    last: None,
+                    delay_ms: self.mouse_rearm_ms,
+                })
                 .input(now, moved, blocked),
         };
         if !jump {
             return;
+        }
+        if source == PointerSource::Touchpad {
+            self.last_trackpad_landing = Some(now);
         }
         drop(cfg);
         self.jump(
@@ -600,6 +680,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     }
     let ctx = &mut *ptr;
     match msg {
+        SET_TRACKPAD_REARM => {
+            ctx.trackpad_rearm_ms = (w as u32).min(crate::preferences::MAX_REARM_MS);
+            if !ctx.trackpad_ready(GetTickCount()) {
+                ctx.touchpad.motion(false, true);
+            }
+            ctx.config.lock().unwrap().snapshot.trackpad_rearm_ms = ctx.trackpad_rearm_ms;
+            0
+        }
+        SET_REARM => {
+            ctx.mouse_rearm_ms = (w as u32).clamp(
+                crate::preferences::MIN_REARM_MS,
+                crate::preferences::MAX_REARM_MS,
+            );
+            for burst in ctx.bursts.values_mut() {
+                burst.delay_ms = ctx.mouse_rearm_ms;
+            }
+            ctx.config.lock().unwrap().snapshot.mouse_rearm_ms = ctx.mouse_rearm_ms;
+            0
+        }
+        WM_HOTKEY if w == 6 => {
+            ctx.scroll_enabled = !ctx.scroll_enabled;
+            if !ctx.scroll_enabled {
+                crate::scroll::update(false, None, GetTickCount());
+            }
+            0
+        }
         WM_INPUT_DEVICE_CHANGE if w == GIDC_REMOVAL as usize => {
             ctx.touchpad.removed(l as usize);
             ctx.bursts.remove(&(l as usize));
@@ -614,7 +720,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 .learning
                 .cancel("Skipped: scrolling");
             if let PointerSource::Mouse(device) = ctx.source {
-                ctx.bursts.entry(device).or_default().last = Some(w as u32);
+                ctx.bursts
+                    .entry(device)
+                    .or_insert(Burst {
+                        last: None,
+                        delay_ms: ctx.mouse_rearm_ms,
+                    })
+                    .last = Some(w as u32);
             }
             0
         }
@@ -672,7 +784,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 }
             };
             let now = GetTickCount();
-            crate::scroll::update(ctx.enabled, point, now);
+            crate::scroll::update(ctx.enabled && ctx.scroll_enabled, point, now);
             let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT]
                 .iter()
                 .any(|k| GetAsyncKeyState(*k as i32) < 0);
@@ -700,6 +812,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     cfg.learning.cancel("Display changed");
                 }
                 cfg.learning.expire(GetTickCount());
+                cfg.snapshot = Snapshot {
+                    trackpad_rearm_ms: ctx.trackpad_rearm_ms,
+                    mouse_rearm_ms: ctx.mouse_rearm_ms,
+                    enabled: ctx.enabled,
+                    dot: ctx.dot_visible,
+                    scroll: ctx.scroll_enabled,
+                    learning: cfg.learning.enabled,
+                    display_ok: ctx.display_ok,
+                    display: cfg.display.name.clone(),
+                    jumps: ctx.jumps,
+                    accepted: cfg.learning.accepted,
+                    updates: cfg.learning.updates,
+                    error: ctx.last_error.clone(),
+                };
             }
             InvalidateRect(hwnd, null(), 0);
             0
@@ -733,6 +859,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trackpad_cooldown_defaults_to_immediate_and_wraps_safely() {
+        assert!(cooldown_ready(None, 0, 2000));
+        assert!(cooldown_ready(Some(100), 100, 0));
+        assert!(!cooldown_ready(Some(100), 399, 300));
+        assert!(cooldown_ready(Some(100), 400, 300));
+        assert!(cooldown_ready(Some(u32::MAX - 49), 0, 50));
+    }
+    #[test]
+    fn configurable_rearm_changes_the_threshold_without_resetting_motion_history() {
+        let mut b = Burst {
+            last: None,
+            delay_ms: 100,
+        };
+        assert!(b.input(0, true, false));
+        assert!(!b.input(99, true, false));
+        assert!(b.input(199, true, false));
+        b.delay_ms = 750;
+        assert!(!b.armed(948));
+        assert!(b.armed(949));
+        b.last = Some(u32::MAX - 49);
+        b.delay_ms = 50;
+        assert!(b.armed(0));
+    }
     #[test]
     fn physical_mouse_keeps_its_own_burst_when_touchpad_is_present() {
         assert_eq!(PointerSource::from_raw(0, true), PointerSource::Touchpad);

@@ -1,8 +1,8 @@
 # EyeTracking
 
-Personal eye-tracking experiments, starting with a Tobii Eye Tracker 5 on Windows.
-The first native Rust gaze preview is implemented and tested with the connected
-ET5 and the installed Tobii Stream Engine 4.25.0.3 on Windows.
+A native Rust desktop companion for the Tobii Eye Tracker 5 on Windows.
+Look at a target, then move your mouse or slide on your trackpad to land there.
+The control panel brings gaze control, scrolling, calibration, and learning together.
 
 ## Run
 
@@ -11,13 +11,48 @@ Set-Location C:\Users\andre\RustroverProjects\EyeTracking
 cargo run --release
 ```
 
-Or run `target\release\gaze-preview.exe` after building. The preview uses the
+Or run `target\release\gaze-preview.exe` after building. Gaze control starts enabled
+on the first launch; subsequent launches remember your switches. The app uses the
 installed DLL at `C:\Program Files\Tobii\Tobii EyeX\tobii_stream_engine.dll`.
 An absolute `TOBII_STREAM_ENGINE_DLL` environment variable can override that path.
 No SDK download or import library is required. The adapter currently accepts
 Stream Engine major version 4; other major versions need an ABI review.
 
-The mint ring shows the latest valid gaze position, with a short fading trail.
+## Control panel and system tray
+
+- **Pause / Resume gaze control** controls mouse and trackpad assistance.
+- **Gaze dot**, **Gaze scroll**, and **Learning** have independent visible switches.
+  Freezing learning keeps the current map; **Reset learning** clears the session's
+  learned corrections after confirmation, keeping saved journals and calibration.
+- **Jump timing** has separate mouse and trackpad fields. Mouse accepts 50–2000 ms
+  (default **300**) of idle time before the next movement can jump. Trackpad accepts
+  0–2000 ms (default **0**) between landing attempts, while still requiring a lift
+  and a new slide. A contact started during that delay stays in fine control until
+  lifted; it never produces a late jump. Zero preserves immediate rearming on lift.
+  Select **Apply** or press Enter to save both values. Scrolling and Windows'
+  double-click protection interval are unchanged.
+- **Calibrate** opens the guided dots. Space is convenient for capturing without
+  moving the pointer; **Capture dot** and **Cancel calibration** are also buttons.
+- **Live preview**, **Calibration results**, and **View learning map** expose the
+  live gaze, measured accuracy, and saved click evidence.
+- **Close (×)** or **Hide to tray** hides only the panel. Tracking and the desktop
+  dot keep running. Click the mint eye icon beside the clock (possibly inside the
+  hidden-icons menu) to reopen. Right-click it for pause, dot, and quit controls.
+- **Quit EyeTracking** stops tracking and exits. Launching the app again while it
+  is already running brings back the existing panel instead of starting another.
+
+Controls support Tab and Space/Enter. No global shortcut is required. The old
+shortcuts below remain optional; a shortcut conflict no longer prevents input
+from starting. Tracker connection, paused state, display changes, and learning
+counts are visible in the panel. The tray icon is restored if Explorer restarts;
+if the tray is unavailable, closing keeps the panel accessible instead of hiding it.
+
+Switches save in `recordings/preferences.json`. Development builds locate the
+repository automatically, including launches from Explorer or a shortcut. A
+standalone executable uses `%LOCALAPPDATA%\EyeTracking` for its data. Journals and
+calibration remain private local files; the live learned field is still session-local.
+
+In **Live preview**, the mint ring shows the latest valid gaze position, with a short fading trail.
 The small stationary dots are visual references, not a calibration procedure.
 No additional smoothing or prediction is applied by this app; the vendor stream
 may already be processed. Invalid/stale samples hide the marker. A worker thread
@@ -39,7 +74,7 @@ handles device access and retries connection failures.
 | T | Toggle gaze trail |
 | G | Toggle fixed targets |
 | Space | Capture the active calibration dot; otherwise hide/show gaze |
-| Esc | Cancel calibration, leave results, or close the preview |
+| Esc | Return to Overview, cancelling an active calibration |
 
 ## Calibration experiment
 
@@ -93,7 +128,8 @@ display available for preview. Mouse control is an optional mode described below
 
 ## Gaze mouse
 
-Run `cargo run --release -- --mouse` to start enabled, or press W in the preview.
+Use **Resume gaze control** in the panel. `--mouse` still forces an enabled start
+for existing launch scripts, overriding a saved paused preference.
 Turn off Tobii Experience's own **Warp on mouse move** to avoid two controllers.
 On a supported touchpad, single-finger contact arms the first raw pointer movement
 to jump to gaze. Touching, tapping, and double tapping without movement never
@@ -127,7 +163,8 @@ A click-through status panel shows ARMED, FINE CONTROL, PAUSED or NO GAZE, plus
 learning and recording status. It starts hidden; **Ctrl+Alt+F6** shows or hides it
 without changing gaze control, the dot, or learning. The panel also includes
 successful and missed jump counts. **Ctrl+Alt+F8** pauses/resumes from any app;
-closing the preview stops the controller. It runs on a separate input thread.
+closing the panel keeps the controller running in the system tray. **Quit** stops
+it. It runs on a separate input thread.
 A tiny gaze dot with a one-pixel white rim stays above desktop apps,
 including while the preview is minimized or mouse jumps are paused. Its center
 uses the same calibrated position as a jump. The dot is nine physical pixels
@@ -139,7 +176,7 @@ fallback's 300 ms rearm interval, and paused
 mouse assistance. Color refreshes every 16 ms, even if the gaze position is still.
 **Ctrl+Alt+F7** shows/hides just the desktop dot from any app; mouse jumps,
 gaze scrolling, and learning continue unchanged. The HUD shows Dot ON/OFF.
-The dot starts visible each time the app launches.
+The dot switch is remembered between launches.
 Raw Input accepts precision touchpads with null device handles, and cursor warps
 do not feed back as physical motion. The latest gaze sample must be valid and no
 older than 200 ms. A missing sample consumes that landing attempt with a visible
