@@ -3,6 +3,8 @@
 //! otherwise applying each residual repeatedly would create a feedback drift.
 //! Spatial errors cannot be represented by one global offset: learn a local
 //! residual field and interpolate it continuously at the base gaze position.
+//! Rejections may be detected during movement, but visual feedback is emitted
+//! only after a matching left-button release, never by movement or timeout alone.
 use serde::Serialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -36,6 +38,7 @@ struct Attempt {
     rect: [i32; 4],
     down: Option<(u32, XY)>,
     drag_path: f64,
+    rejection: Option<&'static str>,
 }
 struct Label {
     time: u32,
@@ -236,18 +239,10 @@ impl Learner {
     }
     pub fn cancel(&mut self, reason: &'static str) {
         if let Some(p) = self.pending.take() {
+            let reason = p.rejection.unwrap_or(reason);
             self.rejected += 1;
             self.status = reason;
             self.record_attempt(&p, false, false, reason);
-            // Do not flash on ordinary gaze jumps, scrolling, pauses or resets.
-            // A rejected click/long correction deserves an honest explanation.
-            if reason == "Skipped: long correction"
-                || reason == "Skipped: drag"
-                || reason == "Skipped: held click"
-                || reason == "Skipped: ambiguous click"
-            {
-                self.publish_feedback(&p, p.landing, false, false, reason);
-            }
         }
     }
     pub fn expire(&mut self, now: u32) {
@@ -275,6 +270,7 @@ impl Learner {
             rect,
             down: None,
             drag_path: 0.0,
+            rejection: None,
         });
         self.status = "Watching correction + click";
     }
@@ -301,19 +297,19 @@ impl Learner {
             p.drag_path += travel;
         }
         if p.path > 240.0 || distance(cursor, p.landing) > MAX_CORRECTION {
-            self.cancel("Skipped: long correction");
-            return;
+            p.rejection.get_or_insert("Skipped: long correction");
         }
         if p.drag_path > 4.0 {
-            self.cancel("Skipped: drag");
-            return;
+            p.rejection.get_or_insert("Skipped: drag");
         }
         if flags & 1 != 0 {
             if p.down.is_some() || now.wrapping_sub(p.time) < 80 {
-                self.cancel("Skipped: ambiguous click");
-                return;
+                p.rejection.get_or_insert("Skipped: ambiguous click");
             }
-            p.down = Some((now, cursor));
+            p.down.get_or_insert((now, cursor));
+        }
+        if let Some(reason) = p.rejection {
+            self.status = reason;
         }
         if flags & 2 != 0 {
             let Some((down_time, target)) = p.down else {
@@ -321,13 +317,19 @@ impl Learner {
                 return;
             };
             if now.wrapping_sub(down_time) > 500 {
-                self.cancel("Skipped: held click");
-                return;
+                p.rejection.get_or_insert("Skipped: held click");
             }
             let label = [target[0] - p.base[0], target[1] - p.base[1]];
             let position = normalized(p.base, p.rect);
             let rect = p.rect;
             let attempt = self.pending.take().unwrap();
+            if let Some(reason) = attempt.rejection {
+                self.rejected += 1;
+                self.status = reason;
+                self.record_attempt(&attempt, false, false, reason);
+                self.publish_feedback(&attempt, attempt.landing, false, false, reason);
+                return;
+            }
             let previous = self.updates;
             let offset = self.offset_at(attempt.base, rect);
             let before = [attempt.base[0] + offset[0], attempt.base[1] + offset[1]];
@@ -755,9 +757,40 @@ mod tests {
         }
         shown.begin(9000, [1000.; 2], [1000.; 2], 1, RECT);
         shown.event(9100, [1200.; 2], 0, 1);
+        assert!(shown.take_feedback().is_none());
+        shown.event(9200, [1200.; 2], 1, 1);
+        assert!(shown.take_feedback().is_none());
+        shown.event(9250, [1200.; 2], 2, 1);
         let rejected = shown.take_feedback().unwrap();
         assert!(!rejected.accepted && !rejected.updated);
-        assert!(rejected.selection.is_none());
+        assert_eq!(rejected.selection, Some([1200.; 2]));
         assert_eq!(rejected.after, rejected.before);
+    }
+    #[test]
+    fn rejected_movement_and_expiry_are_silent_until_a_completed_click() {
+        for end in 0..4 {
+            let mut learner = Learner::default();
+            learner.begin(0, [1000.; 2], [1000.; 2], 1, RECT);
+            learner.event(100, [1300.; 2], 0, 1);
+            assert!(learner.take_feedback().is_none());
+            // Returning near the landing must not rehabilitate a long movement.
+            learner.event(200, [1010.; 2], 0, 1);
+            match end {
+                0 => learner.expire(1600),
+                1 => learner.begin(300, [1000.; 2], [1000.; 2], 1, RECT),
+                2 => learner.event(300, [1010.; 2], 2, 1), // release without press
+                _ => {
+                    learner.event(300, [1010.; 2], 1, 1);
+                    assert!(learner.take_feedback().is_none());
+                    learner.event(350, [1010.; 2], 2, 1);
+                    let event = learner.take_feedback().unwrap();
+                    assert_eq!(event.reason, "Skipped: long correction");
+                    assert!(!event.accepted && !event.updated);
+                }
+            }
+            assert!(learner.take_feedback().is_none());
+            assert_eq!(learner.accepted, 0);
+            assert_eq!(learner.updates, 0);
+        }
     }
 }

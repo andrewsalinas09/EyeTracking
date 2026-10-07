@@ -26,8 +26,10 @@ Stream Engine major version 4; other major versions need an ABI review.
   the correction. Orange marks the original landing; white marks the click;
   mint animates the actual change in predicted landing and reports its pixel size.
   Accepted clicks without consensus say that no map change happened. Rejected
-  long corrections/drags/held or ambiguous clicks explain why they were skipped;
-  a white selection is shown only when a click-down position was captured.
+  long corrections/drags/held or ambiguous clicks explain why they were skipped,
+  but only after a matching left-button release. Movement, timeout, and an
+  unmatched release never trigger the overlay. The white selection is the saved
+  click-down position.
   The animation fades within 2.4 seconds (1.5 for rejections) and never moves the
   real cursor or captures input. Turning visuals off hides an active animation
   immediately and keeps learning running. The visual preference is saved.
