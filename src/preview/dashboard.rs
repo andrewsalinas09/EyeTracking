@@ -201,11 +201,11 @@ pub unsafe fn refresh(hwnd: HWND) {
         hwnd,
         CORNER,
         if !s.corner_available {
-            "Upper-left trial: N/A"
+            "Full-screen trial: N/A"
         } else if s.corner_trial {
-            "Upper-left trial: On"
+            "Full-screen trial: On"
         } else {
-            "Upper-left trial: Off"
+            "Full-screen trial: Off"
         },
         available && s.corner_available,
     );
@@ -794,9 +794,9 @@ pub unsafe fn command(hwnd: HWND, id: u32) {
                     m.set_corner_trial(!m.snapshot().corner_trial);
                     a.preferences.corner_trial = m.snapshot().corner_trial;
                     a.notice = if a.preferences.corner_trial {
-                        "Upper-left trial on: fixed fit, extra movement limited to 150 px."
+                        "Full-screen trial on: fixed fit, extra movement limited to 150 px."
                     } else {
-                        "Upper-left trial off: original learned mapping restored."
+                        "Full-screen trial off: ordinary learned mapping restored."
                     }
                     .into();
                     if let Err(e) = a.preferences.save() {

@@ -1,4 +1,4 @@
-//! Frozen, opt-in upper-left experiment. The private fit stays local and is
+//! Frozen, opt-in whole-screen experiment. The private fit stays local and is
 //! rejected on display/calibration mismatch. Never trains on a future click.
 //! Context comparison allows JSON integer/float spelling and round-trip rounding.
 use serde::{Deserialize, Serialize};
@@ -41,15 +41,6 @@ impl Model {
             std::array::from_fn(|i| p[i].clamp(rect[i] as f64, (rect[i + 2] - 1) as f64))
         };
         let live = clamp(std::array::from_fn(|i| base[i] + offset[i]));
-        let smooth = |p: f64| {
-            let t = ((0.25 - p) / 0.20).clamp(0., 1.);
-            t * t * (3. - 2. * t)
-        };
-        let weight = smooth((live[0] - rect[0] as f64) / size[0])
-            * smooth((live[1] - rect[1] as f64) / size[1]);
-        if weight == 0. {
-            return offset;
-        }
         let [x, y] = std::array::from_fn(|i| (base[i] - rect[i] as f64) / size[i] - 0.5);
         if !(-0.75..=0.75).contains(&x) || !(-0.75..=0.75).contains(&y) {
             return offset;
@@ -72,7 +63,7 @@ impl Model {
                     .sum::<f64>()
         }));
         let delta: XY = std::array::from_fn(|i| predicted[i] - live[i]);
-        let gain = weight * (150. / delta[0].hypot(delta[1]).max(150.));
+        let gain = 150. / delta[0].hypot(delta[1]).max(150.);
         std::array::from_fn(|i| live[i] + gain * delta[i] - base[i])
     }
 }
@@ -111,11 +102,18 @@ mod tests {
         }
     }
     #[test]
-    fn only_upper_left_changes_and_extra_motion_is_bounded() {
+    fn entire_display_changes_and_extra_motion_is_bounded() {
         let m = model();
         let r = [-1000, 0, 1000, 1000];
         for p in [[0., 500.], [900., 50.], [-950., 950.], [900., 950.]] {
-            assert_eq!(m.offset(p, [0., 0.], r), [0., 0.]);
+            let delta = m.offset(p, [0., 0.], r);
+            assert!(delta[0].hypot(delta[1]) > 0.);
+            assert!(delta[0].hypot(delta[1]) <= 150.00001);
+            for axis in 0..2 {
+                assert!(
+                    (r[axis] as f64..=(r[axis + 2] - 1) as f64).contains(&(p[axis] + delta[axis]))
+                );
+            }
         }
         let p = [-990., 10.];
         let delta = m.offset(p, [0., 0.], r);
@@ -127,7 +125,7 @@ mod tests {
         assert!((landed[0] + 1000.).hypot(landed[1]) <= 150.00001);
     }
     #[test]
-    fn blend_is_continuous_at_boundary_and_invalid_models_fail_closed() {
+    fn mapping_is_continuous_across_former_boundary_and_invalid_models_fail_closed() {
         let mut m = model();
         assert!(m.matches("{\"test\":1}"));
         assert!(m.matches("{\"test\":1.0}"));
@@ -140,12 +138,10 @@ mod tests {
             &serde_json::json!({"a":[0,1.0001]})
         ));
         assert!(!m.matches("{\"test\":2}"));
-        assert_eq!(
-            m.offset([250., 20.], [0., 0.], [0, 0, 1000, 1000]),
-            [0., 0.]
-        );
+        let at = m.offset([250., 20.], [0., 0.], [0, 0, 1000, 1000]);
         let d = m.offset([249.999, 20.], [0., 0.], [0, 0, 1000, 1000]);
-        assert!(d[0].hypot(d[1]) < 0.001);
+        assert!((d[0] - at[0]).hypot(d[1] - at[1]) < 0.001);
+        assert!(at[0].hypot(at[1]) > 100.);
         assert_eq!(
             m.offset([-1000., 20.], [0., 0.], [0, 0, 1000, 1000]),
             [0., 0.]

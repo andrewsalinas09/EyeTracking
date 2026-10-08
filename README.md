@@ -594,9 +594,9 @@ backend. No upstream repository has been forked or vendored.
 
 ## Later experiments
 
-### Upper-left correction trial
+### Full-screen correction trial
 
-The Overview sidebar has an **Upper-left trial** toggle (off by default).
+The Overview sidebar has a **Full-screen trial** toggle (off by default).
 It requires a private `recordings/corner-model.json` matching the current display
 and fixed calibration; N/A means no compatible model is loaded. A calibration
 change or learning reset disables the trial. Restart to reload a model file.
@@ -604,12 +604,14 @@ Turning it off immediately restores the current ordinary learned mapping.
 
 The frozen model uses an affine residual plus 15 smooth Gaussian spatial terms,
 ridge regularization and four robust fitting passes. It predicts from unclamped
-fixed-calibrated gaze. Its blend uses the existing landing position: full strength
-within the top-left 5%, fading to zero at 25% from either edge. Extra movement is
-limited to 150 physical pixels. Extrapolation beyond 25% outside the display is
+fixed-calibrated gaze across the entire display. Extra movement from the ordinary
+learned landing toward the frozen prediction is limited to 150 physical pixels.
+Extrapolation beyond 25% outside the display is
 ignored. Dot, pointer jumps and scrolling share this correction. Normal online
-learning continues, with its existing click eligibility rules; the frozen fit
-does not update. Missing gaze still cannot produce a reliable destination.
+learning continues in the background, with its existing click eligibility rules;
+the frozen fit does not update. Where it is within 150 px of the ordinary landing,
+the trial uses the frozen prediction directly. Turning the trial off reveals the
+ordinary learned map. Missing gaze still cannot produce a reliable destination.
 
 Build a local fit with Node 24+:
 
@@ -624,10 +626,11 @@ drag, <=600 px path and <=300 px correction). Archived edge landings are allowed
 Model files and recordings stay out of Git. `examples/corner_replay.rs` can replay
 this exact runtime correction against private held-out prediction rows.
 
-In an exploratory replay of 26 later-session upper-left clicks, median error was
-182 -> 89 px and p90 was 260 -> 146 px; one click worsened by more than 50 px.
-Other regions' medians were unchanged. The latest session informed selection of
-this experiment, so this is not an untouched final test set. Live comparison on
+Full-screen exploratory replay (263 later-session clicks) is mixed: upper-left
+median error 182 -> 89 px, upper-right 74 -> 65, bottom-left 50 -> 46,
+bottom-right 50 -> 52, and noncorner 41 -> 49. Noncorner p90 improves 130 -> 116 px,
+but nine clicks across the display worsen by more than 50 px. The latest session
+informed selection of this experiment, so this is not an untouched final test set. Live comparison on
 new clicks is needed before treating the improvement as established.
 
 - Gaze-assisted selection with explicit keyboard or CharaChorder confirmation.

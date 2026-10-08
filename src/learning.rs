@@ -318,7 +318,7 @@ impl Learner {
         crate::capture::record(
             "corner_trial",
             None,
-            json!({"enabled":self.corner_enabled,"model":self.corner,"region":"upper_left","max_extra_pixels":150}),
+            json!({"enabled":self.corner_enabled,"model":self.corner,"region":"whole_screen","max_extra_pixels":150}),
         );
     }
     pub fn record_context(
@@ -329,7 +329,7 @@ impl Learner {
         let data = json!({"kind":"context", "schema":1, "epoch":self.epoch,
                 "display":display, "base_model":model, "grid":[COLS,ROWS], "field":self.field.as_slice(),
                 "coordinates":"physical desktop pixels; base gaze is after fixed calibration",
-                "corner_model":self.corner,"corner_enabled":self.corner_enabled,
+                "corner_model":self.corner,"corner_enabled":self.corner_enabled,"corner_region":"whole_screen",
                 "learner":"spatial-v2.1", "rules":{"max_click_ms":MAX_CLICK_MS,"max_correction_px":MAX_CORRECTION,"max_path_px":600,"min_click_ms":80,"max_hold_ms":500,"max_drag_px":4,
                     "max_step_px":MAX_STEP,"max_offset_px":MAX_OFFSET,"consensus_radius_px":CONSENSUS_RADIUS,"history_ms":HISTORY_MS,"max_labels":MAX_LABELS,"enabled":self.enabled}});
         crate::capture::record("context", None, data.clone());
@@ -1021,10 +1021,12 @@ mod tests {
         }
         let updates = learner.updates;
         assert!(updates > 0);
-        let live = learner.offset_at(pixels([0.5, 0.5], RECT), RECT);
+        let trial = learner.offset_at(pixels([0.5, 0.5], RECT), RECT);
         learner.toggle_corner();
         assert_eq!(learner.offset_at(p, RECT), baseline);
-        assert_eq!(learner.offset_at(pixels([0.5, 0.5], RECT), RECT), live);
+        let live = learner.offset_at(pixels([0.5, 0.5], RECT), RECT);
+        assert!(distance(live, [20., -10.]) < 1.);
+        assert!(distance(live, trial) > 100.);
         assert_eq!(learner.updates, updates);
         learner.reset();
         assert!(!learner.corner_enabled);
