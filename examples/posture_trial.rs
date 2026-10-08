@@ -10,6 +10,8 @@
 mod calibration;
 #[path = "../src/capture.rs"]
 mod capture;
+#[path = "../src/corner.rs"]
+mod corner;
 #[path = "../src/learning.rs"]
 mod learning;
 #[path = "../src/learning_log.rs"]

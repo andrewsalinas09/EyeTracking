@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 mod calibration;
 mod capture;
+mod corner;
 mod gaze_dot;
 mod learning;
 mod learning_feedback;

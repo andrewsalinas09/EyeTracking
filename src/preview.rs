@@ -958,6 +958,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                                 scroll: s.scroll,
                                 learning: s.learning,
                                 learning_feedback: app.preferences.learning_feedback,
+                                corner_trial: s.corner_trial,
                                 mouse_rearm_ms: s.mouse_rearm_ms,
                                 trackpad_rearm_ms: s.trackpad_rearm_ms,
                             };
@@ -1238,6 +1239,7 @@ pub fn run() {
                     ) {
                         Ok(mouse) => {
                             mouse.set_rearm_delay(a.preferences.mouse_rearm_ms);
+                            mouse.set_corner_trial(a.preferences.corner_trial);
                             mouse.set_trackpad_rearm_delay(a.preferences.trackpad_rearm_ms);
                             if !a.preferences.dot {
                                 mouse.command(4);

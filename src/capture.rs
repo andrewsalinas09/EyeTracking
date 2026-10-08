@@ -164,6 +164,7 @@ impl ClickWindow {
                 | "learning_reset"
                 | "calibration_change"
                 | "calibration_session"
+                | "corner_trial"
         )
     }
     fn accept(&mut self, mut event: Event) -> Vec<Event> {

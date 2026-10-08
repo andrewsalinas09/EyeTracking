@@ -41,6 +41,8 @@ pub struct Snapshot {
     pub dot: bool,
     pub scroll: bool,
     pub learning: bool,
+    pub corner_trial: bool,
+    pub corner_available: bool,
     pub learning_status: String,
     pub learning_storage: String,
     pub display_ok: bool,
@@ -300,6 +302,14 @@ impl Controller {
     }
     pub fn snapshot(&self) -> Snapshot {
         self.config.lock().unwrap().snapshot.clone()
+    }
+    pub fn set_corner_trial(&self, enabled: bool) {
+        let mut cfg = self.config.lock().unwrap();
+        if cfg.learning.corner_enabled != enabled {
+            cfg.learning.toggle_corner();
+        }
+        cfg.snapshot.corner_trial = cfg.learning.corner_enabled;
+        cfg.snapshot.corner_available = cfg.learning.corner_available();
     }
     pub fn take_learning_feedback(&self) -> Option<crate::learning::Feedback> {
         self.config.lock().unwrap().learning.take_feedback()
@@ -937,6 +947,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     dot: ctx.dot_visible,
                     scroll: ctx.scroll_enabled,
                     learning: cfg.learning.enabled,
+                    corner_trial: cfg.learning.corner_enabled,
+                    corner_available: cfg.learning.corner_available(),
                     learning_status: cfg.learning.status.into(),
                     learning_storage: cfg.learning.storage_status(),
                     display_ok: ctx.display_ok,

@@ -594,6 +594,42 @@ backend. No upstream repository has been forked or vendored.
 
 ## Later experiments
 
+### Upper-left correction trial
+
+The Overview sidebar has an **Upper-left trial** toggle (off by default).
+It requires a private `recordings/corner-model.json` matching the current display
+and fixed calibration; N/A means no compatible model is loaded. A calibration
+change or learning reset disables the trial. Restart to reload a model file.
+Turning it off immediately restores the current ordinary learned mapping.
+
+The frozen model uses an affine residual plus 15 smooth Gaussian spatial terms,
+ridge regularization and four robust fitting passes. It predicts from unclamped
+fixed-calibrated gaze. Its blend uses the existing landing position: full strength
+within the top-left 5%, fading to zero at 25% from either edge. Extra movement is
+limited to 150 physical pixels. Extrapolation beyond 25% outside the display is
+ignored. Dot, pointer jumps and scrolling share this correction. Normal online
+learning continues, with its existing click eligibility rules; the frozen fit
+does not update. Missing gaze still cannot produce a reliable destination.
+
+Build a local fit with Node 24+:
+
+```powershell
+node tools/train_corner.cjs recordings/learning.sqlite3 TEST_SESSION_ID recordings/corner-model.json
+```
+
+The trainer reads a consistent SQLite snapshot, takes only compatible sessions
+strictly before the named test session, and refuses to overwrite its output.
+Labels require a completed short click (80–3000 ms delay, <=500 ms hold, <=4 px
+drag, <=600 px path and <=300 px correction). Archived edge landings are allowed.
+Model files and recordings stay out of Git. `examples/corner_replay.rs` can replay
+this exact runtime correction against private held-out prediction rows.
+
+In an exploratory replay of 26 later-session upper-left clicks, median error was
+182 -> 89 px and p90 was 260 -> 146 px; one click worsened by more than 50 px.
+Other regions' medians were unchanged. The latest session informed selection of
+this experiment, so this is not an untouched final test set. Live comparison on
+new clicks is needed before treating the improvement as established.
+
 - Gaze-assisted selection with explicit keyboard or CharaChorder confirmation.
 - UI-aware target selection and confidence visualization.
 - Moving-target validation, accounting for eye-movement dynamics.

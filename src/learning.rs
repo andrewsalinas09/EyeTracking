@@ -83,6 +83,8 @@ pub struct Learner {
     context_key: Option<String>,
     storage_error: String,
     interaction: Option<u64>,
+    corner: Option<crate::corner::Model>,
+    pub corner_enabled: bool,
 }
 impl Default for Learner {
     fn default() -> Self {
@@ -103,6 +105,8 @@ impl Default for Learner {
             context_key: None,
             storage_error: String::new(),
             interaction: None,
+            corner: None,
+            corner_enabled: false,
         }
     }
 }
@@ -208,6 +212,7 @@ impl Learner {
         }
         self.reset();
         self.context_key = Some(key.clone());
+        self.corner = crate::corner::Model::load(&key);
         if let Some(store) = &self.store {
             match store.load(key) {
                 Ok(Some(state)) => {
@@ -304,6 +309,18 @@ impl Learner {
             );
         }
     }
+    pub fn corner_available(&self) -> bool {
+        self.corner.is_some()
+    }
+    pub fn toggle_corner(&mut self) {
+        self.cancel("Skipped: corner trial changed");
+        self.corner_enabled = !self.corner_enabled && self.corner.is_some();
+        crate::capture::record(
+            "corner_trial",
+            None,
+            json!({"enabled":self.corner_enabled,"model":self.corner,"region":"upper_left","max_extra_pixels":150}),
+        );
+    }
     pub fn record_context(
         &self,
         display: &crate::calibration::Display,
@@ -312,6 +329,7 @@ impl Learner {
         let data = json!({"kind":"context", "schema":1, "epoch":self.epoch,
                 "display":display, "base_model":model, "grid":[COLS,ROWS], "field":self.field.as_slice(),
                 "coordinates":"physical desktop pixels; base gaze is after fixed calibration",
+                "corner_model":self.corner,"corner_enabled":self.corner_enabled,
                 "learner":"spatial-v2.1", "rules":{"max_click_ms":MAX_CLICK_MS,"max_correction_px":MAX_CORRECTION,"max_path_px":600,"min_click_ms":80,"max_hold_ms":500,"max_drag_px":4,
                     "max_step_px":MAX_STEP,"max_offset_px":MAX_OFFSET,"consensus_radius_px":CONSENSUS_RADIUS,"history_ms":HISTORY_MS,"max_labels":MAX_LABELS,"enabled":self.enabled}});
         crate::capture::record("context", None, data.clone());
@@ -338,7 +356,7 @@ impl Learner {
                 "last_input_flags":p.last_flags, "landing_surface":p.surface,"last_surface":p.last_surface,
                 "jump_tick_ms":p.time,"end_tick_ms":p.last_time,"button_down_tick_ms":p.down.map(|(t,_)|t),
                 "click_delay_ms":p.down.map(|(t,_)|t.wrapping_sub(p.time)),"drag_path_px":p.drag_path,
-                "button_up_observed":p.last_flags&2!=0,"interaction":p.interaction,
+                "button_up_observed":p.last_flags&2!=0,"interaction":p.interaction,"corner_enabled":self.corner_enabled,
                 "grid":[COLS,ROWS], "field":updated.then_some(self.field.as_slice()), "evidence":p.evidence});
         crate::capture::record("attempt", Some(p.interaction), data.clone());
         if let Some(log) = &self.recorder {
@@ -361,12 +379,19 @@ impl Learner {
             (ix + (iy + 1) * COLS, (1.0 - fx) * fy),
             (ix + 1 + (iy + 1) * COLS, fx * fy),
         ];
-        std::array::from_fn(|axis| {
+        let offset = std::array::from_fn(|axis| {
             corners
                 .iter()
                 .map(|(i, w)| self.field[*i].offset[axis] * w)
                 .sum()
-        })
+        });
+        if self.corner_enabled {
+            self.corner
+                .as_ref()
+                .map_or(offset, |m| m.offset(base, offset, rect))
+        } else {
+            offset
+        }
     }
     pub fn coverage(&self) -> (usize, usize) {
         (
@@ -973,6 +998,36 @@ mod tests {
 
     fn pixels(p: XY, rect: [i32; 4]) -> XY {
         std::array::from_fn(|a| rect[a] as f64 + p[a] * (rect[a + 2] - rect[a]) as f64)
+    }
+
+    #[test]
+    fn corner_toggle_restores_baseline_without_changing_live_learning() {
+        let mut learner = Learner::default();
+        let mut coefficients = vec![[0., 0.]; 18];
+        coefficients[0] = [100., 100.];
+        learner.corner = Some(crate::corner::Model {
+            version: 1,
+            context: json!({}),
+            coefficients,
+            training_samples: 40,
+            trained_before_ms: 1,
+        });
+        let p = pixels([0.01, 0.01], RECT);
+        let baseline = learner.offset_at(p, RECT);
+        learner.toggle_corner();
+        assert!(distance(learner.offset_at(p, RECT), baseline) > 100.);
+        for n in 0..100 {
+            learner.observe(n * 100, [0.5, 0.5], [20., -10.], RECT);
+        }
+        let updates = learner.updates;
+        assert!(updates > 0);
+        let live = learner.offset_at(pixels([0.5, 0.5], RECT), RECT);
+        learner.toggle_corner();
+        assert_eq!(learner.offset_at(p, RECT), baseline);
+        assert_eq!(learner.offset_at(pixels([0.5, 0.5], RECT), RECT), live);
+        assert_eq!(learner.updates, updates);
+        learner.reset();
+        assert!(!learner.corner_enabled);
     }
 
     #[test]

@@ -30,6 +30,7 @@ const TRACKPAD_EDIT: u32 = 124;
 const REFIT: u32 = 125;
 const FEEDBACK: u32 = 126;
 const FEEDBACK_DEMO: u32 = 127;
+const CORNER: u32 = 128;
 const ALL: &[u32] = &[
     HOME,
     PREVIEW,
@@ -58,6 +59,7 @@ const ALL: &[u32] = &[
     REFIT,
     FEEDBACK,
     FEEDBACK_DEMO,
+    CORNER,
 ];
 const BG: u32 = 0x211913;
 const CARD: u32 = 0x2e251d;
@@ -195,6 +197,18 @@ pub unsafe fn refresh(hwnd: HWND) {
     };
     let available = snapshot.is_some();
     let s = snapshot.unwrap_or_default();
+    caption(
+        hwnd,
+        CORNER,
+        if !s.corner_available {
+            "Upper-left trial: N/A"
+        } else if s.corner_trial {
+            "Upper-left trial: On"
+        } else {
+            "Upper-left trial: Off"
+        },
+        available && s.corner_available,
+    );
     for (id, text) in [
         (HOME, "Overview"),
         (PREVIEW, "Live preview"),
@@ -311,6 +325,7 @@ pub unsafe fn layout(hwnd: HWND) {
             (RESULTS, 16., 264., 160., 42.),
             (FEEDBACK, 16., 316., 160., 42.),
             (FEEDBACK_DEMO, 16., 368., 160., 36.),
+            (CORNER, 16., 448., 160., 38.),
             (HIDE, 16., h - 112., 160., 40.),
             (QUIT, 16., h - 60., 160., 40.),
             (POWER, w - 220., 150., 180., 44.),
@@ -773,6 +788,23 @@ pub unsafe fn command(hwnd: HWND, id: u32) {
             });
         }
         HOME => home(hwnd),
+        CORNER => APP.with(|a| {
+            if let Some(a) = a.borrow_mut().as_mut() {
+                if let Some(m) = &a.mouse {
+                    m.set_corner_trial(!m.snapshot().corner_trial);
+                    a.preferences.corner_trial = m.snapshot().corner_trial;
+                    a.notice = if a.preferences.corner_trial {
+                        "Upper-left trial on: fixed fit, extra movement limited to 150 px."
+                    } else {
+                        "Upper-left trial off: original learned mapping restored."
+                    }
+                    .into();
+                    if let Err(e) = a.preferences.save() {
+                        a.notice = format!("Could not save trial preference: {e}");
+                    }
+                }
+            }
+        }),
         FEEDBACK => APP.with(|a| {
             if let Some(a) = a.borrow_mut().as_mut() {
                 a.preferences.learning_feedback = !a.preferences.learning_feedback;
