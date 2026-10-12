@@ -3,6 +3,8 @@
 //! the first event. The hook never waits for locks, renders, or accesses files.
 //! Driver-generated wheel events are valid input: filter only our tagged replays,
 //! not all LLMHF_INJECTED events (which can include trackpad helper software).
+//! The same hook hands hardware pointer events to mouse::hook, which lands
+//! jumps with try-locks only and falls back to raw input when a lock is busy.
 use std::{
     cell::RefCell,
     mem::{size_of, zeroed},
@@ -171,10 +173,20 @@ fn accept_wheel(event: &MSLLHOOKSTRUCT) -> bool {
     event.dwExtraInfo != REPLAY_TAG && event.mouseData >> 16 != 0
 }
 unsafe extern "system" fn callback(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code < 0 || !matches!(w as u32, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
+    if code < 0 {
         return CallNextHookEx(null_mut(), code, w, l);
     }
     let event = &*(l as *const MSLLHOOKSTRUCT);
+    // This hook also lands mouse jumps; see mouse::hook for why raw input can't.
+    if event.flags & LLMHF_INJECTED == 0 {
+        let owner = STATE.with(|s| s.try_borrow().ok()?.as_ref().map(|s| s.owner));
+        if owner.is_some_and(|owner| crate::mouse::hook(owner, w as u32, event)) {
+            return 1;
+        }
+    }
+    if !matches!(w as u32, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
+        return CallNextHookEx(null_mut(), code, w, l);
+    }
     if !accept_wheel(event) {
         return CallNextHookEx(null_mut(), code, w, l);
     }

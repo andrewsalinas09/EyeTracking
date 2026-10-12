@@ -4,6 +4,8 @@
 //! connected; only Windows' null-device touchpad motion uses contact state. This window
 //! runs on its own thread so full-screen preview painting cannot stall input.
 //! Precision touchpads can have a null hDevice; that is deliberately accepted.
+//! Mouse landings happen in the scroll module's low-level hook when possible:
+//! a raw-input landing races packets Windows has already positioned.
 use crate::{
     calibration::{Display, Model, Report},
     tobii::State,
@@ -90,10 +92,58 @@ impl Burst {
     fn input(&mut self, now: u32, moved: bool, blocked: bool) -> bool {
         let jump = moved && !blocked && self.armed(now);
         if moved || blocked {
-            self.last = Some(now);
+            self.touch(now);
         }
         jump
     }
+    /// Raw input for a packet arrives after hooks for later packets; never let
+    /// that older timestamp move `last` backwards and rearm a burst mid-motion.
+    fn touch(&mut self, now: u32) {
+        if self.last.is_none_or(|t| now.wrapping_sub(t) as i32 >= 0) {
+            self.last = Some(now);
+        }
+    }
+    /// Low-level hook view of one motion packet: the same rule as `input`, but
+    /// an eligible packet is not consumed until the landing is resolved, so a
+    /// hook that cannot land without waiting leaves the decision to raw input.
+    fn hook_motion(&mut self, now: u32, blocked: bool) -> bool {
+        if blocked || !self.armed(now) {
+            self.touch(now);
+            return false;
+        }
+        true
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Landing {
+    /// A lock was held elsewhere; nothing changed and raw input may still land.
+    Busy,
+    Skipped,
+    Moved,
+}
+fn acquire<T>(m: &Mutex<T>, wait: bool) -> Option<std::sync::MutexGuard<'_, T>> {
+    if wait {
+        Some(m.lock().unwrap())
+    } else {
+        m.try_lock().ok()
+    }
+}
+thread_local! {
+    /// Nonzero while `wndproc` runs; the hook never re-enters the context then.
+    static DISPATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+/// Called from the low-level mouse hook on this input thread, before Windows
+/// commits the event. Raw input arrives after later packets have already
+/// captured the old cursor position, so a raw-input jump can be overwritten
+/// ~2 ms later by queued motion (MX Master 4 Bluetooth sends packets <1 ms
+/// apart). Landing here and swallowing that packet makes every later packet
+/// start from the gaze point. Returns true to swallow the event.
+pub unsafe fn hook(owner: HWND, msg: u32, event: &MSLLHOOKSTRUCT) -> bool {
+    if DISPATCH_DEPTH.with(|d| d.get()) != 0 {
+        return false;
+    }
+    let ptr = GetWindowLongPtrW(owner, GWLP_USERDATA) as *mut Context;
+    !ptr.is_null() && (*ptr).hook(msg, event.time)
 }
 struct Config {
     snapshot: Snapshot,
@@ -602,15 +652,68 @@ impl Context {
             } else {
                 "mouse"
             },
+            true,
         );
     }
-    unsafe fn jump(&mut self, now: u32, modifiers: bool, source: &str) {
-        let mut cfg = self.config.lock().unwrap();
+    /// Hook-side mirror of the mouse branch of `input`. Raw input for the same
+    /// packets still arrives afterwards; it sees the burst already consumed.
+    unsafe fn hook(&mut self, msg: u32, now: u32) -> bool {
+        if matches!(
+            msg,
+            WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+                | WM_XBUTTONDOWN
+                | WM_XBUTTONUP
+        ) {
+            // Raw input for this click may still be queued behind later hooks.
+            self.last_click = Some(now);
+        }
+        let PointerSource::Mouse(device) = self.source else {
+            return false;
+        };
+        let Some(burst) = self.bursts.get_mut(&device) else {
+            return false;
+        };
+        if msg != WM_MOUSEMOVE {
+            burst.touch(now); // Buttons and wheel block, as in `input`.
+            return false;
+        }
+        let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT]
+            .iter()
+            .any(|k| GetAsyncKeyState(*k as i32) < 0);
+        let blocked = buttons_down()
+            || recent_click(self.last_click, now, GetDoubleClickTime())
+            || !self.enabled
+            || modifiers
+            || !self.display_ok
+            || GetTickCount().wrapping_sub(now) > 100;
+        if !burst.hook_motion(now, blocked) {
+            return false;
+        }
+        let landing = self.jump(now, modifiers, "mouse", false);
+        if landing != Landing::Busy {
+            if let Some(burst) = self.bursts.get_mut(&device) {
+                burst.touch(now);
+            }
+        }
+        landing == Landing::Moved
+    }
+    unsafe fn jump(&mut self, now: u32, modifiers: bool, source: &str, wait: bool) -> Landing {
+        // The hook path must never wait: Windows drops slow low-level hooks.
+        let Some(mut cfg) = acquire(&self.config, wait) else {
+            return Landing::Busy;
+        };
         if !self.enabled || cfg.calibrating || modifiers || buttons_down() {
-            return;
+            return Landing::Skipped;
         }
         let evidence = {
-            let state = self.state.lock().unwrap();
+            let Some(state) = acquire(&self.state, wait) else {
+                return Landing::Busy;
+            };
             state
                 .samples
                 .back()
@@ -637,7 +740,7 @@ impl Context {
                 cfg.learning.interaction(),
                 serde_json::json!({"source":source,"success":false,"reason":self.last_error,"input_message_tick_ms":now,"evidence":evidence,"rect":cfg.display.rect}),
             );
-            return;
+            return Landing::Skipped;
         }
         let [x, y] = cfg.screen_point(point.unwrap());
         let mut old: POINT = zeroed();
@@ -672,6 +775,7 @@ impl Context {
                     cfg.learning.attach_evidence(evidence);
                 }
             }
+            Landing::Moved
         } else {
             let error = windows_sys::Win32::Foundation::GetLastError();
             self.misses += 1;
@@ -682,6 +786,7 @@ impl Context {
                 cfg.learning.interaction(),
                 serde_json::json!({"source":source,"success":false,"reason":self.last_error,"windows_error":error,"input_message_tick_ms":now,"base_unclamped":base,"prediction_unclamped":predicted,"requested_landing":[x,y],"evidence":evidence}),
             );
+            Landing::Skipped
         }
     }
     unsafe fn paint(&self, hwnd: HWND) {
@@ -772,6 +877,12 @@ unsafe extern "system" fn monitor_check(
     1
 }
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    DISPATCH_DEPTH.with(|d| d.set(d.get() + 1));
+    let result = dispatch(hwnd, msg, w, l);
+    DISPATCH_DEPTH.with(|d| d.set(d.get() - 1));
+    result
+}
+unsafe fn dispatch(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Context;
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, w, l);
@@ -842,7 +953,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         last: None,
                         delay_ms: ctx.mouse_rearm_ms,
                     })
-                    .last = Some(w as u32);
+                    .touch(w as u32);
             }
             0
         }
@@ -1056,6 +1167,38 @@ mod tests {
         assert!(!b.input(400, false, true));
         assert!(!b.input(500, true, false));
         assert!(b.input(800, true, false));
+    }
+    #[test]
+    fn hook_landing_consumes_the_burst_so_raw_input_cannot_land_twice() {
+        let mut b = Burst::default();
+        assert!(b.hook_motion(0, false));
+        b.last = Some(0); // Landed (or missed) in the hook.
+        assert!(!b.input(0, true, false)); // Raw input for the same packet.
+        assert!(!b.input(5, true, false));
+        assert!(b.hook_motion(305, false));
+    }
+    #[test]
+    fn busy_hook_leaves_the_decision_to_raw_input() {
+        let mut b = Burst::default();
+        assert!(b.hook_motion(0, false)); // Locks busy: nothing committed.
+        assert!(b.input(0, true, false));
+    }
+    #[test]
+    fn blocked_hook_motion_restarts_idle_like_raw_input() {
+        let mut b = Burst::default();
+        assert!(!b.hook_motion(0, true)); // E.g. inside the double-click guard.
+        assert!(!b.hook_motion(299, false));
+        assert!(!b.input(0, true, true)); // Raw input arrives late; same result.
+        assert!(!b.hook_motion(310, false)); // Late raw input did not rearm.
+        assert!(b.hook_motion(610, false));
+    }
+    #[test]
+    fn late_timestamps_never_move_the_burst_backwards_across_clock_wrap() {
+        let mut b = Burst::default();
+        b.touch(u32::MAX - 10);
+        b.touch(5);
+        b.touch(u32::MAX - 20);
+        assert_eq!(b.last, Some(5));
     }
     #[test]
     fn missed_gaze_consumes_attempt_and_clock_wrap_is_safe() {
