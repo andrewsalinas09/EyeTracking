@@ -9,6 +9,10 @@ use std::{
     cell::RefCell,
     mem::{size_of, zeroed},
     ptr::null_mut,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -16,6 +20,7 @@ use windows_sys::Win32::{
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 pub const SCROLLED: u32 = WM_APP + 2;
+pub const FOCUS: u32 = WM_APP + 5; // +3/+4 belong to mouse rearm settings.
 const REPLAY_TAG: usize = 0x45594553;
 #[derive(Default)]
 struct Gesture {
@@ -41,6 +46,8 @@ struct State {
     received: u64,
     synthesized: u64,
     status: &'static str,
+    worker: mpsc::Sender<Replay>,
+    pending: Arc<AtomicUsize>,
 }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
 pub struct ScrollFocus(HHOOK);
@@ -50,6 +57,11 @@ impl ScrollFocus {
         if hook.is_null() {
             return Err("Could not install gaze scroll hook".into());
         }
+        let (tx, rx) = mpsc::channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (owner_id, worker_pending) = (owner as usize, pending.clone());
+        // Exits when State (holding the sender) is dropped.
+        std::thread::spawn(move || worker(rx, owner_id, worker_pending));
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 owner,
@@ -63,6 +75,8 @@ impl ScrollFocus {
                 received: 0,
                 synthesized: 0,
                 status: "Ready",
+                worker: tx,
+                pending,
             })
         });
         Ok(Self(hook))
@@ -210,12 +224,23 @@ unsafe extern "system" fn callback(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if !accept_wheel(event) {
         return CallNextHookEx(null_mut(), code, w, l);
     }
-    STATE.with(|s| {
-        if let Some(s) = s.borrow_mut().as_mut() {
-            s.received += 1;
-            s.synthesized += u64::from(event.flags & LLMHF_INJECTED != 0);
-        }
+    let pending = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let s = s.as_mut()?;
+        s.received += 1;
+        s.synthesized += u64::from(event.flags & LLMHF_INJECTED != 0);
+        Some((s.pending.load(Ordering::Acquire) != 0, s.owner))
     });
+    if let Some((true, owner)) = pending {
+        PostMessageW(owner, SCROLLED, GetTickCount() as WPARAM, 0);
+        if queue(Replay {
+            message: w as u32,
+            data: event.mouseData,
+            target: None,
+        }) {
+            return 1;
+        }
+    }
     // Leave drag, zoom, and modifier gestures alone.
     let blocked = [
         VK_LBUTTON,
@@ -263,36 +288,64 @@ unsafe extern "system" fn callback(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         set_status("No activatable window under gaze");
         return CallNextHookEx(null_mut(), code, w, l);
     }
-    let mut old: POINT = zeroed();
     if !choose_target(root, now, first) {
         return CallNextHookEx(null_mut(), code, w, l);
     }
-    if GetCursorPos(&mut old) == 0 || SetCursorPos(x, y) == 0 {
-        set_status("Windows rejected pointer movement");
-        return CallNextHookEx(null_mut(), code, w, l);
+    if queue(Replay {
+        message: w as u32,
+        data: event.mouseData,
+        target: Some(([x, y], root as usize)),
+    }) {
+        return 1;
     }
-    let focused = GetForegroundWindow() == root || SetForegroundWindow(root) != 0;
-    let input = wheel_input(w as u32, event.mouseData);
-    if SendInput(1, &input, size_of::<INPUT>() as i32) == 1 {
-        STATE.with(|s| {
-            if let Some(s) = s.borrow_mut().as_mut() {
-                s.count += 1;
-                s.status = if focused {
-                    "Focused gaze window"
-                } else {
-                    "Hover moved; Windows denied focus"
-                };
-            }
-        });
-        return 1; // Original suppressed only after successful replay.
-    }
-    SetCursorPos(old.x, old.y);
-    STATE.with(|s| {
-        if let Some(s) = s.borrow_mut().as_mut() {
-            s.status = "Replay failed; normal scrolling";
-        }
-    });
     CallNextHookEx(null_mut(), code, w, l)
+}
+/// A swallowed wheel event for the worker to deliver, after first moving the
+/// pointer to `target` when it starts a switch.
+struct Replay {
+    message: u32,
+    data: u32,
+    target: Option<([i32; 2], usize)>,
+}
+/// Moving the pointer and injecting input from inside the hook froze all input
+/// until the ~300 ms hook timeout, so the hook only queues. Later notches
+/// queue behind a pending switch, keeping order and the new target.
+fn queue(replay: Replay) -> bool {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(s) = s.as_mut() else {
+            return false;
+        };
+        if s.worker.send(replay).is_err() {
+            return false;
+        }
+        s.pending.fetch_add(1, Ordering::AcqRel);
+        s.count += 1;
+        true
+    })
+}
+fn worker(rx: mpsc::Receiver<Replay>, owner: usize, pending: Arc<AtomicUsize>) {
+    for replay in rx {
+        unsafe {
+            if let Some(([x, y], root)) = replay.target {
+                SetCursorPos(x, y);
+                let focused = GetForegroundWindow() == root as HWND
+                    || SetForegroundWindow(root as HWND) != 0;
+                PostMessageW(owner as HWND, FOCUS, focused as WPARAM, 0);
+            }
+            let input = wheel_input(replay.message, replay.data);
+            SendInput(1, &input, size_of::<INPUT>() as i32);
+        }
+        pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+/// Result of an activation made off the hook thread.
+pub fn focused(focused: bool) {
+    set_status(if focused {
+        "Focused gaze window"
+    } else {
+        "Hover moved; Windows denied focus"
+    });
 }
 fn set_status(text: &'static str) {
     STATE.with(|s| {

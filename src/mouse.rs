@@ -974,6 +974,10 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             }
             0
         }
+        crate::scroll::FOCUS => {
+            crate::scroll::focused(w != 0);
+            0
+        }
         WM_INPUT => {
             ctx.input(l);
             DefWindowProcW(hwnd, msg, w, l)
