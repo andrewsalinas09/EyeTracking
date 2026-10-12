@@ -268,6 +268,7 @@ impl Controller {
                 motions: 0,
                 last_error: String::new(),
                 display_ok: true,
+                display_rect: rect,
                 touchpad: crate::touchpad::Touchpad::default(),
             });
             let hwnd = CreateWindowExW(
@@ -315,7 +316,10 @@ impl Controller {
                 ctx.last_error = "Could not register Precision Touchpad input".into();
             }
             let _scroll = match crate::scroll::ScrollFocus::start(hwnd) {
-                Ok(scroll) => Some(scroll),
+                Ok(scroll) => {
+                    crate::scroll::set_display(ctx.display_rect);
+                    Some(scroll)
+                }
                 Err(error) => {
                     ctx.last_error = error;
                     None
@@ -452,6 +456,8 @@ struct Context {
     motions: u64,
     last_error: String,
     display_ok: bool,
+    /// Tracked display, cached so the hook can check the cursor without a lock.
+    display_rect: [i32; 4],
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -460,6 +466,15 @@ unsafe fn buttons_down() -> bool {
     [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
         .iter()
         .any(|k| GetAsyncKeyState(*k as i32) < 0)
+}
+/// Movement that starts on another monitor is ordinary pointer control: the
+/// gaze map covers only the tracked display.
+fn on_display(p: POINT, rect: [i32; 4]) -> bool {
+    p.x >= rect[0] && p.x < rect[2] && p.y >= rect[1] && p.y < rect[3]
+}
+pub unsafe fn cursor_on_display(rect: [i32; 4]) -> bool {
+    let mut cursor: POINT = zeroed();
+    GetCursorPos(&mut cursor) == 0 || on_display(cursor, rect)
 }
 unsafe fn surface_at(point: POINT) -> usize {
     GetAncestor(WindowFromPoint(point), GA_ROOT) as usize
@@ -623,6 +638,7 @@ impl Context {
             || cfg.calibrating
             || modifiers
             || !self.display_ok
+            || (has_cursor && !on_display(cursor, cfg.display.rect))
             || GetTickCount().wrapping_sub(now) > 100;
         let jump = match source {
             PointerSource::Touchpad => self
@@ -690,6 +706,7 @@ impl Context {
             || !self.enabled
             || modifiers
             || !self.display_ok
+            || !cursor_on_display(self.display_rect)
             || GetTickCount().wrapping_sub(now) > 100;
         if !burst.hook_motion(now, blocked) {
             return false;
@@ -1019,6 +1036,7 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 .any(|k| GetAsyncKeyState(*k as i32) < 0);
             let ready = point.is_some()
                 && ctx.enabled
+                && cursor_on_display(ctx.display_rect)
                 && !buttons_down()
                 && !modifiers
                 && ctx.armed(now)
@@ -1035,6 +1053,8 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 &mut check as *mut _ as LPARAM,
             );
             ctx.display_ok = check.1;
+            ctx.display_rect = check.0.rect;
+            crate::scroll::set_display(ctx.display_rect);
             {
                 let mut cfg = ctx.config.lock().unwrap();
                 if !ctx.display_ok {
@@ -1167,6 +1187,19 @@ mod tests {
         assert!(!b.input(400, false, true));
         assert!(!b.input(500, true, false));
         assert!(b.input(800, true, false));
+    }
+    #[test]
+    fn only_the_tracked_display_can_start_a_jump() {
+        let rect = [0, 0, 1920, 1080];
+        assert!(on_display(POINT { x: 0, y: 0 }, rect));
+        assert!(on_display(POINT { x: 1919, y: 1079 }, rect));
+        assert!(!on_display(POINT { x: 1920, y: 500 }, rect)); // Monitor to the right.
+        assert!(!on_display(POINT { x: -1, y: 500 }, rect));
+        assert!(!on_display(POINT { x: 500, y: 1080 }, rect));
+        let mut b = Burst::default();
+        assert!(!b.hook_motion(0, true)); // Started on another monitor.
+        assert!(!b.hook_motion(200, false)); // Crossing over mid-motion stays fine control.
+        assert!(b.hook_motion(500, false));
     }
     #[test]
     fn hook_landing_consumes_the_burst_so_raw_input_cannot_land_twice() {

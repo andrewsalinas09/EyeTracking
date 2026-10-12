@@ -32,6 +32,8 @@ struct State {
     owner: HWND,
     enabled: bool,
     point: Option<[i32; 2]>,
+    /// Tracked display; a pointer elsewhere scrolls where it is.
+    display: Option<[i32; 4]>,
     updated: u32,
     gesture: Gesture,
     focus: FocusLatch,
@@ -53,6 +55,7 @@ impl ScrollFocus {
                 owner,
                 enabled: false,
                 point: None,
+                display: None,
                 updated: 0,
                 gesture: Gesture::default(),
                 focus: FocusLatch::default(),
@@ -86,6 +89,23 @@ pub fn update(enabled: bool, point: Option<[i32; 2]>, now: u32) {
         }
     });
 }
+pub fn set_display(rect: [i32; 4]) {
+    STATE.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.display = Some(rect);
+        }
+    });
+}
+/// Gaze scroll, like a mouse jump, only starts from the tracked display.
+unsafe fn pointer_elsewhere(s: &mut State) -> bool {
+    let elsewhere = s
+        .display
+        .is_some_and(|rect| !crate::mouse::cursor_on_display(rect));
+    if elsewhere {
+        s.status = "Pointer on another monitor; normal scrolling";
+    }
+    elsewhere
+}
 pub fn status() -> String {
     STATE.with(|s| {
         s.borrow().as_ref().map_or_else(
@@ -112,7 +132,7 @@ pub unsafe fn touchpad(active: bool, trigger: bool, scrolling: bool) {
         if active {
             s.gesture.last = Some(now);
         }
-        if !scrolling {
+        if !scrolling || pointer_elsewhere(s) {
             return None;
         }
         if s.point.is_none() || now.wrapping_sub(s.updated) > 100 {
@@ -223,6 +243,9 @@ unsafe extern "system" fn callback(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         }
         PostMessageW(s.owner, SCROLLED, now as WPARAM, 0);
         let first = s.gesture.first(now);
+        if pointer_elsewhere(s) {
+            return None;
+        }
         if now.wrapping_sub(s.updated) > 100 || s.point.is_none() {
             s.status = "No fresh gaze; normal scrolling";
             return None;
