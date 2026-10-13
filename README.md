@@ -189,6 +189,9 @@ display available for preview. Mouse control is an optional mode described below
 Use **Resume gaze control** in the panel. `--mouse` still forces an enabled start
 for existing launch scripts, overriding a saved paused preference.
 Turn off Tobii Experience's own **Warp on mouse move** to avoid two controllers.
+Movement that starts with the pointer on another monitor never jumps; it stays
+ordinary pointer control, even after crossing onto the tracked display, until
+the next pause. Gaze scroll likewise scrolls in place from another monitor.
 On a supported touchpad, single-finger contact arms the first raw pointer movement
 to jump to gaze. Touching, tapping, and double tapping without movement never
 jump. Start a small slide to land, then continue sliding to refine and click.
