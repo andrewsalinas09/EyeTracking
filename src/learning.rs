@@ -22,6 +22,13 @@ const MAX_STEP: f64 = 6.0;
 const COLS: usize = 65;
 const ROWS: usize = 37;
 const MAX_LABELS: usize = 1024;
+/// Attempts that end on, or were aimed at, another monitor are not gaze errors:
+/// the map covers only the tracked display. They stay in the journal, tagged.
+pub const POINTER_ELSEWHERE: &str = "Skipped: pointer moved to another monitor";
+pub const GAZE_ELSEWHERE: &str = "Skipped: gaze on another monitor";
+fn other_monitor(reason: &str) -> bool {
+    reason == POINTER_ELSEWHERE || reason == GAZE_ELSEWHERE
+}
 
 #[derive(Clone, Copy, Default, Serialize)]
 struct Node {
@@ -334,7 +341,7 @@ impl Learner {
         let data = json!({"kind":"attempt", "epoch":self.epoch, "rect":p.rect,
                 "base":p.base, "landing":p.landing, "target":p.down.map(|(_,target)|target),
                 "last":p.last, "path_px":p.path, "accepted":accepted, "updated":updated,
-                "status":reason, "elapsed_ms":p.last_time.wrapping_sub(p.time),
+                "status":reason, "other_monitor":other_monitor(reason), "elapsed_ms":p.last_time.wrapping_sub(p.time),
                 "last_input_flags":p.last_flags, "landing_surface":p.surface,"last_surface":p.last_surface,
                 "jump_tick_ms":p.time,"end_tick_ms":p.last_time,"button_down_tick_ms":p.down.map(|(t,_)|t),
                 "click_delay_ms":p.down.map(|(t,_)|t.wrapping_sub(p.time)),"drag_path_px":p.drag_path,
@@ -464,6 +471,13 @@ impl Learner {
         });
         self.status = "Watching correction + click";
     }
+    /// The gaze estimate is on another monitor, so the jump was not aimed at
+    /// this display and whatever follows is not a correction of it.
+    pub fn gaze_elsewhere(&mut self) {
+        if let Some(p) = &mut self.pending {
+            p.rejection = Some(GAZE_ELSEWHERE);
+        }
+    }
     pub fn attach_evidence(&mut self, evidence: crate::pose::Evidence) {
         if let Some(p) = &mut self.pending {
             p.evidence = Some(evidence);
@@ -491,7 +505,7 @@ impl Learner {
             .enumerate()
             .all(|(i, x)| x.is_finite() && *x >= p.rect[i] as f64 && *x < p.rect[i + 2] as f64)
         {
-            Some("Skipped: outside calibrated display")
+            Some(POINTER_ELSEWHERE)
         } else {
             None
         };
@@ -536,7 +550,9 @@ impl Learner {
                 self.rejected += 1;
                 self.status = reason;
                 self.record_attempt(&attempt, false, false, reason);
-                self.publish_feedback(&attempt, attempt.landing, false, false, reason);
+                if !other_monitor(reason) {
+                    self.publish_feedback(&attempt, attempt.landing, false, false, reason);
+                }
                 return;
             }
             let previous = self.updates;
@@ -842,6 +858,21 @@ mod tests {
             assert_eq!(l.accepted, 0, "case {kind}");
             assert_eq!(local_offset(&l), [0.0; 2]);
         }
+    }
+    #[test]
+    fn other_monitor_attempts_are_tagged_and_never_shown_as_errors() {
+        let mut l = Learner::default();
+        l.begin(0, [1000.0; 2], [1000.0; 2], 1, RECT);
+        l.event(100, [-5.0, 1000.0], 0, 2);
+        assert_eq!(l.status, POINTER_ELSEWHERE);
+        l.begin(1000, [1000.0; 2], [1000.0; 2], 1, RECT);
+        l.gaze_elsewhere();
+        l.event(1200, [1010.0; 2], 1, 1);
+        l.event(1250, [1010.0; 2], 2, 1);
+        assert_eq!(l.status, GAZE_ELSEWHERE);
+        assert!(l.take_feedback().is_none());
+        assert_eq!(l.accepted, 0);
+        assert!(other_monitor(POINTER_ELSEWHERE) && !other_monitor("Skipped: edge landing"));
     }
     #[test]
     fn short_cross_window_corrections_and_click_opened_windows_are_eligible() {

@@ -313,6 +313,9 @@ outcome, and reason. Input flags, elapsed time and window handles help distingui
 why attempts were rejected. Updated attempts and context/reset records include the dense field;
 context records also include grid dimensions, display and fixed calibration model.
 Resets begin new periods without deleting old diagnostic journals.
+Attempts where the pointer moves onto, or the gaze lands on, another monitor are
+tagged `other_monitor`; they are never learned, show no feedback animation, and
+the map hides them by default (filter **Another monitor** to view them).
 Only attempts initiated by an eligible gaze jump are recorded, not the full gaze
 stream or every desktop click. Saving and report generation run on a separate
 writer thread; the HUD reports save errors. Events are flushed after each record.

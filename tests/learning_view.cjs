@@ -8,7 +8,9 @@ const html = fs.readFileSync(path.join(__dirname, '../src/learning_view.html'), 
 const field = Array.from({length:35}, (_,i)=>({offset:[i%3, -(i%4)], trained:i<8}));
 const context = epoch=>({kind:'context',schema:1,epoch,display:{rect:[-3840,-2160,0,0]},field});
 const attempt = (accepted,updated,target,epoch=0)=>({kind:'attempt',epoch,timestamp_ms:1700000000000,rect:[-3840,-2160,0,0],base:[-2000,-1000],landing:[-1990,-995],last:[-1980,-980],target,path_px:25,accepted,updated,status:accepted?'Learning local correction map':'Skipped: drag',field});
-const records=[context(0),attempt(true,false,[-1980,-980]),attempt(true,true,[-1980,-980]),attempt(false,false,null),{kind:'reset',epoch:1,field:[]},context(1)];
+const away=(status,tag)=>({...attempt(false,false,[-1980,-980]),status,...tag});
+const records=[context(0),attempt(true,false,[-1980,-980]),attempt(true,true,[-1980,-980]),attempt(false,false,null),
+ away('Skipped: gaze on another monitor',{other_monitor:true}),away('Skipped: outside calibrated display'),{kind:'reset',epoch:1,field:[]},context(1)];
 const elements = new Map();
 const drawing = new Proxy({}, {get:(_,key)=> (...args)=>{for(const v of args)if(typeof v==='number')assert.ok(Number.isFinite(v), `${key}: ${v}`);},set:()=>true});
 function element(id='') {
@@ -22,11 +24,11 @@ vm.runInContext(script,sandbox);
 const get=id=>elements.get(id);
 assert.match(get('stats').textContent,/0 attempts/); // Most recent reset starts empty.
 get('epoch').value='0';get('epoch').onchange();
-assert.match(get('stats').textContent,/3 attempts · 2 eligible clicks · 1 map updates · 8\/35/);
-assert.equal(get('body').children.length,3);
+assert.match(get('stats').textContent,/3 attempts · 2 eligible clicks · 1 map updates · 8\/35 grid points trained · 2 on another monitor/);
+assert.equal(get('body').children.length,3); // Other-monitor attempts are not drawn as errors.
 get('body').children[1].onclick();
 assert.match(get('detail').textContent,/pointer landing: \(-1990.0, -995.0\)/);
-for(const [filter,count] of [['accepted',2],['updated',1],['rejected',1],['all',3]]){
+for(const [filter,count] of [['accepted',2],['updated',1],['rejected',1],['elsewhere',2],['all',3]]){
  get('filter').value=filter;get('filter').onchange();assert.equal(get('body').children.length,count);
 }
 for(const scale of ['1','3','6']){get('scale').value=scale;get('scale').onchange();}

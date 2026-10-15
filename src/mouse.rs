@@ -476,6 +476,17 @@ pub unsafe fn cursor_on_display(rect: [i32; 4]) -> bool {
     let mut cursor: POINT = zeroed();
     GetCursorPos(&mut cursor) == 0 || on_display(cursor, rect)
 }
+/// Gaze off the tracked display counts as elsewhere only where a monitor
+/// actually is; off the bezel of a lone display is still an edge landing.
+unsafe fn gaze_on_other_monitor(base: [f64; 2], rect: [i32; 4]) -> bool {
+    let p = POINT {
+        x: base[0].round() as i32,
+        y: base[1].round() as i32,
+    };
+    base.iter().all(|v| v.is_finite())
+        && !on_display(p, rect)
+        && MonitorFromPoint(p, MONITOR_DEFAULTTONULL) != 0 as _
+}
 unsafe fn surface_at(point: POINT) -> usize {
     GetAncestor(WindowFromPoint(point), GA_ROOT) as usize
 }
@@ -788,6 +799,9 @@ impl Context {
             if !modifiers && actual_ok && actual.x == x && actual.y == y {
                 cfg.learning
                     .begin(now, base, [x as f64, y as f64], surface_at(actual), rect);
+                if gaze_on_other_monitor(base, rect) {
+                    cfg.learning.gaze_elsewhere();
+                }
                 if let Some(evidence) = evidence {
                     cfg.learning.attach_evidence(evidence);
                 }
