@@ -896,10 +896,9 @@ unsafe extern "system" fn monitor_check(
     info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
     if GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO) != 0 {
         let r = info.monitorInfo.rcMonitor;
-        let name = String::from_utf16_lossy(
-            &info.szDevice[..info.szDevice.iter().position(|c| *c == 0).unwrap_or(32)],
-        );
-        *matched |= display.name == name && display.rect == [r.left, r.top, r.right, r.bottom];
+        // Match on geometry only: Windows renumbers \\.\DISPLAYn after a replug or
+        // wake, and the calibration depends on the desktop rect, not the name.
+        *matched |= display.rect == [r.left, r.top, r.right, r.bottom];
     }
     1
 }
